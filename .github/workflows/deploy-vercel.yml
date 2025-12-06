@@ -63,6 +63,28 @@ jobs:
       - name: Install Vercel CLI
         run: bun add -g vercel@latest
 
+      - name: Link Vercel Project
+        run: |
+          # Create or link to Vercel project
+          # Uses project_slug as the project name, prefixed with "lumea-"
+          PROJECT_NAME="lumea-${{ inputs.project_slug }}"
+
+          echo "Linking to Vercel project: $PROJECT_NAME"
+
+          # Link will create the project if it doesn't exist
+          vercel link --yes --project=$PROJECT_NAME --token=${{ secrets.VERCEL_TOKEN }} --scope=${{ secrets.VERCEL_ORG_ID }}
+
+          # Verify .vercel/project.json was created
+          if [ -f .vercel/project.json ]; then
+            echo "Project linked successfully"
+            cat .vercel/project.json
+          else
+            echo "Warning: .vercel/project.json not created"
+          fi
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+
       - name: Build with Vercel
         id: build
         run: |
