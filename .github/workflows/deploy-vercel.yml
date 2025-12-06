@@ -43,7 +43,9 @@ on:
 
 env:
   PLATFORM_DOMAIN: lumea-ai.app
-  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  # NOTE: VERCEL_ORG_ID is NOT set globally because Vercel CLI
+  # requires VERCEL_PROJECT_ID if ORG_ID is set as env var.
+  # We pass it via --scope flag instead.
 
 jobs:
   deploy:
@@ -71,7 +73,8 @@ jobs:
 
           echo "Linking to Vercel project: $PROJECT_NAME"
 
-          # Link will create the project if it doesn't exist
+          # IMPORTANT: Do NOT set VERCEL_ORG_ID as env var here
+          # If set, CLI requires VERCEL_PROJECT_ID too. Use --scope instead.
           vercel link --yes --project=$PROJECT_NAME --token=${{ secrets.VERCEL_TOKEN }} --scope=${{ secrets.VERCEL_ORG_ID }}
 
           # Verify .vercel/project.json was created
@@ -83,7 +86,7 @@ jobs:
           fi
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          # NOTE: VERCEL_ORG_ID intentionally NOT set here
 
       - name: Build with Vercel
         id: build
