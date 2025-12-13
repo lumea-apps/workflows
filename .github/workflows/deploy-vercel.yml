@@ -47,7 +47,7 @@ on:
         required: true
       VERCEL_ORG_ID:
         required: true
-      WEBHOOK_SECRET:
+      LUMEA_WEBHOOK_SECRET:
         required: true
       PROJECT_SECRETS:
         required: false
@@ -241,17 +241,17 @@ jobs:
           PAYLOAD="${PAYLOAD}}"
 
           echo "Sending webhook to Lumea..."
-          curl -X POST "${{ vars.DEPLOYMENT_WEBHOOK_URL }}" \
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
             -d "$PAYLOAD"
 
       - name: Notify Lumea (Failure)
         if: failure()
         run: |
-          curl -X POST "${{ vars.DEPLOYMENT_WEBHOOK_URL }}" \
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
             -d '{
               "projectId": "${{ inputs.lumea_project_id }}",
               "status": "error",
