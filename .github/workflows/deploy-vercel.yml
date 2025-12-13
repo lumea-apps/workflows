@@ -80,7 +80,6 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
       - name: Sync environment variables to Vercel
-        if: secrets.PROJECT_SECRETS != ''
         run: |
           SECRETS='${{ secrets.PROJECT_SECRETS }}'
           TARGET="${{ inputs.app_target }}"
