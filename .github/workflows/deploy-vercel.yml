@@ -54,7 +54,6 @@ on:
 
 env:
   PLATFORM_DOMAIN: lumea-ai.app
-  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
 
 jobs:
   deploy:
@@ -76,8 +75,6 @@ jobs:
 
       - name: Link Vercel Project
         run: vercel link --yes --token=${{ secrets.VERCEL_TOKEN }}
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
       - name: Sync environment variables to Vercel
         run: |
