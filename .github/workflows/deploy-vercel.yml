@@ -99,10 +99,10 @@ jobs:
             VALUE=$(echo "$entry" | base64 -d | jq -r '.value')
 
             # Remove existing env var if it exists (ignore errors)
-            vercel env rm "$KEY" production --yes --token=${{ secrets.VERCEL_TOKEN }} 2>/dev/null || true
+            vercel env rm "$KEY" production -y --token=${{ secrets.VERCEL_TOKEN }} 2>/dev/null || true
 
             # Add new value
-            echo "$VALUE" | vercel env add "$KEY" production --yes --token=${{ secrets.VERCEL_TOKEN }}
+            echo "$VALUE" | vercel env add "$KEY" production --token=${{ secrets.VERCEL_TOKEN }}
 
             echo "✓ Synced: $KEY"
           done
