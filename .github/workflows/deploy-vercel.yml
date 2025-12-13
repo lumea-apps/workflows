@@ -4,15 +4,19 @@
 # at .github/workflows/deploy-vercel.yml
 #
 # It handles:
-# 1. Building the project with Vercel CLI
-# 2. Deploying to Vercel
-# 3. Configuring platform and custom domains
-# 4. Calling the Lumea webhook with results
+# 1. Syncing project secrets to Vercel environment variables
+# 2. Building the project with Vercel CLI
+# 3. Deploying to Vercel
+# 4. Configuring platform and custom domains
+# 5. Calling the Lumea webhook with results
 #
 # Secrets are inherited from the lumea-apps organization:
 # - VERCEL_TOKEN: Vercel API token
 # - VERCEL_ORG_ID: Vercel team/org ID
-# - LUMEA_WEBHOOK_SECRET: Shared secret for webhook authentication
+# - WEBHOOK_SECRET: Shared secret for webhook authentication
+# - PROJECT_SECRETS: JSON with project environment variables (optional)
+#
+# @see SHO-96 - Project Secrets Management
 
 name: Deploy to Vercel
 
@@ -32,20 +36,25 @@ on:
         required: false
         type: string
         default: ''
+      app_target:
+        description: 'App target for secrets filtering (web, api, worker, all)'
+        required: false
+        type: string
+        default: 'all'
     # Secrets are inherited from org level via `secrets: inherit`
     secrets:
       VERCEL_TOKEN:
         required: true
       VERCEL_ORG_ID:
         required: true
-      LUMEA_WEBHOOK_SECRET:
+      WEBHOOK_SECRET:
         required: true
+      PROJECT_SECRETS:
+        required: false
 
 env:
   PLATFORM_DOMAIN: lumea-ai.app
-  # NOTE: VERCEL_ORG_ID is NOT set globally because Vercel CLI
-  # requires VERCEL_PROJECT_ID if ORG_ID is set as env var.
-  # We pass it via --scope flag instead.
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
 
 jobs:
   deploy:
@@ -66,27 +75,45 @@ jobs:
         run: bun add -g vercel@latest
 
       - name: Link Vercel Project
-        run: |
-          # Create or link to Vercel project
-          # Uses project_slug as the project name, prefixed with "lumea-"
-          PROJECT_NAME="lumea-${{ inputs.project_slug }}"
-
-          echo "Linking to Vercel project: $PROJECT_NAME"
-
-          # IMPORTANT: Do NOT set VERCEL_ORG_ID as env var here
-          # If set, CLI requires VERCEL_PROJECT_ID too. Use --scope instead.
-          vercel link --yes --project=$PROJECT_NAME --token=${{ secrets.VERCEL_TOKEN }} --scope=${{ secrets.VERCEL_ORG_ID }}
-
-          # Verify .vercel/project.json was created
-          if [ -f .vercel/project.json ]; then
-            echo "Project linked successfully"
-            cat .vercel/project.json
-          else
-            echo "Warning: .vercel/project.json not created"
-          fi
+        run: vercel link --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          # NOTE: VERCEL_ORG_ID intentionally NOT set here
+
+      - name: Sync environment variables to Vercel
+        if: secrets.PROJECT_SECRETS != ''
+        run: |
+          SECRETS='${{ secrets.PROJECT_SECRETS }}'
+          TARGET="${{ inputs.app_target }}"
+
+          if [ -z "$SECRETS" ] || [ "$SECRETS" = "" ]; then
+            echo "No project secrets configured, skipping sync"
+            exit 0
+          fi
+
+          echo "Syncing environment variables for target: $TARGET"
+
+          # Combine "all" target with specific target
+          # Format: { "all": {...}, "web": {...}, "api": {...} }
+          echo "$SECRETS" | jq -r "
+            ((.all // {}) + (.[\"$TARGET\"] // {}))
+            | to_entries[]
+            | @base64
+          " | while read -r entry; do
+            KEY=$(echo "$entry" | base64 -d | jq -r '.key')
+            VALUE=$(echo "$entry" | base64 -d | jq -r '.value')
+
+            # Remove existing env var if it exists (ignore errors)
+            vercel env rm "$KEY" production --yes --token=${{ secrets.VERCEL_TOKEN }} 2>/dev/null || true
+
+            # Add new value
+            echo "$VALUE" | vercel env add "$KEY" production --yes --token=${{ secrets.VERCEL_TOKEN }}
+
+            echo "✓ Synced: $KEY"
+          done
+
+          echo "Environment variables sync complete"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
       - name: Build with Vercel
         id: build
@@ -215,17 +242,17 @@ jobs:
           PAYLOAD="${PAYLOAD}}"
 
           echo "Sending webhook to Lumea..."
-          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
+          curl -X POST "${{ vars.DEPLOYMENT_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SECRET }}" \
             -d "$PAYLOAD"
 
       - name: Notify Lumea (Failure)
         if: failure()
         run: |
-          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
+          curl -X POST "${{ vars.DEPLOYMENT_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SECRET }}" \
             -d '{
               "projectId": "${{ inputs.lumea_project_id }}",
               "status": "error",
