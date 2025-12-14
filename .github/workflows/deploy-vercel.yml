@@ -76,6 +76,34 @@ jobs:
       - name: Link Vercel Project
         run: vercel link --yes --token=${{ secrets.VERCEL_TOKEN }}
 
+      - name: Disable Deployment Protection
+        run: |
+          # Get project ID from .vercel/project.json
+          PROJECT_ID=$(cat .vercel/project.json | jq -r '.projectId')
+
+          echo "Disabling deployment protection for project: $PROJECT_ID"
+
+          # Disable SSO Protection (Vercel Authentication) and Password Protection
+          # This allows public access to preview deployments
+          # @see https://vercel.com/docs/rest-api/reference/endpoints/projects/update-an-existing-project
+          RESPONSE=$(curl -s -X PATCH "https://api.vercel.com/v9/projects/$PROJECT_ID?teamId=${{ secrets.VERCEL_ORG_ID }}" \
+            -H "Authorization: Bearer ${{ secrets.VERCEL_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "ssoProtection": null,
+              "passwordProtection": null
+            }')
+
+          # Check if request was successful
+          if echo "$RESPONSE" | jq -e '.id' > /dev/null 2>&1; then
+            echo "✓ Deployment protection disabled successfully"
+          else
+            echo "⚠ Warning: Could not disable deployment protection"
+            echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+          fi
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
       - name: Sync environment variables to Vercel
         run: |
           SECRETS='${{ secrets.PROJECT_SECRETS }}'
