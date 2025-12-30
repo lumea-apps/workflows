@@ -1,0 +1,161 @@
+# Reusable Workflow: Deploy to Expo Snack
+#
+# This workflow should be placed in the lumea-apps/workflows repository
+# at .github/workflows/deploy-snack.yml
+#
+# It handles:
+# 1. Creating/updating an Expo Snack from the repository
+# 2. Calling the Lumea webhook with the Snack URL
+#
+# Secrets are inherited from the lumea-apps organization:
+# - LUMEA_WEBHOOK_SECRET: Shared secret for webhook authentication
+# - EXPO_TOKEN: Expo access token (optional, for org Snacks)
+#
+# @see SHO-122 - Mobile Preview via Snack
+
+name: Deploy to Snack
+
+on:
+  workflow_call:
+    inputs:
+      lumea_project_id:
+        description: 'Lumea Project ID'
+        required: true
+        type: string
+    secrets:
+      LUMEA_WEBHOOK_SECRET:
+        required: true
+      EXPO_TOKEN:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create Snack
+        id: snack
+        run: |
+          # Read package.json for app name
+          APP_NAME=$(cat package.json | jq -r '.name // "expo-app"')
+
+          # Create a temporary directory for the Snack payload
+          SNACK_DIR=$(mktemp -d)
+
+          # Copy relevant files to the Snack payload
+          # Snack expects a specific structure with App.js/App.tsx as entry
+          cp -r . "$SNACK_DIR/"
+
+          # Read all source files and create Snack payload
+          # We'll use the Snack API to create/update
+
+          # Generate a deterministic Snack ID based on repo
+          SNACK_ID_BASE="${{ github.repository }}"
+          SNACK_HASH=$(echo -n "$SNACK_ID_BASE" | md5sum | cut -c1-12)
+
+          echo "Creating Snack for: $APP_NAME"
+          echo "Repository: ${{ github.repository }}"
+          echo "Commit: ${{ github.sha }}"
+
+          # Build the files payload for Snack API
+          # Read main files and encode them
+          FILES_JSON="{}"
+
+          # Helper function to add file to JSON
+          add_file() {
+            local path="$1"
+            if [ -f "$path" ]; then
+              local content=$(cat "$path" | jq -Rs '.')
+              FILES_JSON=$(echo "$FILES_JSON" | jq --arg path "$path" --argjson content "$content" '. + {($path): {"type": "CODE", "contents": $content}}')
+            fi
+          }
+
+          # Add key files
+          for file in App.tsx App.js app.json package.json babel.config.js tsconfig.json; do
+            add_file "$file"
+          done
+
+          # Add files from common directories
+          for dir in src components screens hooks utils lib assets; do
+            if [ -d "$dir" ]; then
+              find "$dir" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.json" \) | head -50 | while read -r file; do
+                add_file "$file"
+              done
+            fi
+          done
+
+          # Read dependencies from package.json
+          DEPENDENCIES=$(cat package.json | jq -c '.dependencies // {}')
+
+          # Create Snack via API
+          # Note: Using the public Snack save endpoint
+          SNACK_PAYLOAD=$(cat <<EOF
+          {
+            "name": "$APP_NAME",
+            "description": "Deployed from ${{ github.repository }}",
+            "files": $FILES_JSON,
+            "dependencies": $DEPENDENCIES,
+            "sdkVersion": "52.0.0"
+          }
+          EOF
+          )
+
+          # Save to Snack API
+          RESPONSE=$(curl -s -X POST "https://snack.expo.dev/api/v2/snack/save" \
+            -H "Content-Type: application/json" \
+            -d "$SNACK_PAYLOAD")
+
+          # Extract Snack ID from response
+          SNACK_ID=$(echo "$RESPONSE" | jq -r '.id // empty')
+
+          if [ -z "$SNACK_ID" ]; then
+            echo "Failed to create Snack"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          # Build Snack URLs
+          SNACK_WEB_URL="https://snack.expo.dev/$SNACK_ID"
+          SNACK_EXPO_URL="exp://exp.host/@snack/$SNACK_ID"
+
+          echo "snack_id=$SNACK_ID" >> $GITHUB_OUTPUT
+          echo "snack_url=$SNACK_EXPO_URL" >> $GITHUB_OUTPUT
+          echo "snack_web_url=$SNACK_WEB_URL" >> $GITHUB_OUTPUT
+
+          echo "Snack created successfully!"
+          echo "Web URL: $SNACK_WEB_URL"
+          echo "Expo URL: $SNACK_EXPO_URL"
+
+      - name: Notify Lumea (Success)
+        if: success()
+        run: |
+          curl -X POST "${{ vars.LUMEA_MOBILE_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -d '{
+              "projectId": "${{ inputs.lumea_project_id }}",
+              "status": "ready",
+              "snackUrl": "${{ steps.snack.outputs.snack_url }}",
+              "snackId": "${{ steps.snack.outputs.snack_id }}",
+              "commitSha": "${{ github.sha }}"
+            }'
+
+      - name: Notify Lumea (Failure)
+        if: failure()
+        run: |
+          curl -X POST "${{ vars.LUMEA_MOBILE_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -d '{
+              "projectId": "${{ inputs.lumea_project_id }}",
+              "status": "error",
+              "error": "Failed to create Snack",
+              "commitSha": "${{ github.sha }}"
+            }'
