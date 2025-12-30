@@ -136,11 +136,12 @@ jobs:
       - name: Notify Lumea (Success)
         if: success()
         run: |
-          curl -X POST "${{ vars.LUMEA_MOBILE_WEBHOOK_URL }}" \
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
             -d '{
               "projectId": "${{ inputs.lumea_project_id }}",
+              "type": "mobile",
               "status": "ready",
               "snackUrl": "${{ steps.snack.outputs.snack_url }}",
               "snackId": "${{ steps.snack.outputs.snack_id }}",
@@ -150,11 +151,12 @@ jobs:
       - name: Notify Lumea (Failure)
         if: failure()
         run: |
-          curl -X POST "${{ vars.LUMEA_MOBILE_WEBHOOK_URL }}" \
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
             -d '{
               "projectId": "${{ inputs.lumea_project_id }}",
+              "type": "mobile",
               "status": "error",
               "error": "Failed to create Snack",
               "commitSha": "${{ github.sha }}"
