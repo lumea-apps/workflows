@@ -56,7 +56,7 @@ jobs:
           }
 
           const PROJECT_ROOT = process.cwd();
-          const SDK_VERSION = '52.0.0';
+          const SDK_VERSION = '54.0.0';
           const SNACK_RUNTIME_ID = '933fd9c0-1666-11e7-afca-d980795c5824';
 
           // Read app name from package.json
@@ -159,12 +159,12 @@ jobs:
           }
 
           function getDependencies() {
-            // Default Expo dependencies
+            // Default Expo dependencies (SDK 54)
             const deps = {
-              'expo': { version: '~52.0.0', wantedVersion: '~52.0.0' },
-              'react': { version: '18.2.0', wantedVersion: '18.2.0' },
-              'react-native': { version: '0.76.0', wantedVersion: '0.76.0' },
-              'expo-status-bar': { version: '~2.0.0', wantedVersion: '~2.0.0' },
+              'expo': { version: '~54.0.0', wantedVersion: '~54.0.0' },
+              'react': { version: '18.3.1', wantedVersion: '18.3.1' },
+              'react-native': { version: '0.76.9', wantedVersion: '0.76.9' },
+              'expo-status-bar': { version: '~2.1.0', wantedVersion: '~2.1.0' },
             };
 
             // Read additional dependencies from package.json
