@@ -56,8 +56,24 @@ jobs:
           }
 
           const PROJECT_ROOT = process.cwd();
-          const SDK_VERSION = '54.0.0';
           const SNACK_RUNTIME_ID = '933fd9c0-1666-11e7-afca-d980795c5824';
+
+          // Read SDK version from package.json (source of truth)
+          let SDK_VERSION = '54.0.0'; // fallback only
+          try {
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const expoVersion = pkg.dependencies?.expo || pkg.devDependencies?.expo;
+            if (expoVersion) {
+              // Extract version number: "~54.0.0" -> "54.0.0", "^53.0.0" -> "53.0.0"
+              const match = expoVersion.match(/(\d+\.\d+\.\d+)/);
+              if (match) {
+                SDK_VERSION = match[1];
+                console.log(`Detected Expo SDK version from package.json: ${SDK_VERSION}`);
+              }
+            }
+          } catch (e) {
+            console.warn('Could not read SDK version from package.json, using fallback:', SDK_VERSION);
+          }
 
           // Read app name from package.json
           let appName = 'Lumea App';
@@ -159,26 +175,50 @@ jobs:
           }
 
           function getDependencies() {
-            // Default Expo dependencies (SDK 54)
-            const deps = {
-              'expo': { version: '~54.0.0', wantedVersion: '~54.0.0' },
-              'react': { version: '18.3.1', wantedVersion: '18.3.1' },
-              'react-native': { version: '0.76.9', wantedVersion: '0.76.9' },
-              'expo-status-bar': { version: '~2.1.0', wantedVersion: '~2.1.0' },
-            };
+            // Read ALL dependencies from package.json (source of truth)
+            const deps = {};
 
-            // Read additional dependencies from package.json
             try {
               const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-              const pkgDeps = pkg.dependencies || {};
+              const pkgDeps = { ...pkg.dependencies, ...pkg.devDependencies } || {};
+
+              console.log('Reading dependencies from package.json...');
 
               for (const [name, version] of Object.entries(pkgDeps)) {
-                // Skip core deps (already handled)
-                if (['expo', 'react', 'react-native'].includes(name)) continue;
+                // Skip dev-only tools that Snack doesn't need
+                const skipPackages = [
+                  '@types/', 'typescript', 'eslint', 'prettier',
+                  '@babel/', 'metro', 'jest', '@testing-library'
+                ];
+                if (skipPackages.some(skip => name.includes(skip))) continue;
 
-                deps[name] = { version: version, wantedVersion: version };
+                // Clean version string (remove workspace:, file:, etc.)
+                let cleanVersion = version;
+                if (version.startsWith('workspace:') || version.startsWith('file:')) {
+                  console.warn(`Skipping local dependency: ${name}@${version}`);
+                  continue;
+                }
+
+                deps[name] = { version: cleanVersion, wantedVersion: cleanVersion };
               }
-            } catch (e) {}
+
+              console.log(`Found ${Object.keys(deps).length} dependencies:`);
+              console.log(Object.keys(deps).join(', '));
+
+            } catch (e) {
+              console.error('Failed to read package.json:', e.message);
+              // Minimal fallback only if package.json is completely missing
+              return {
+                'expo': { version: '~54.0.0', wantedVersion: '~54.0.0' },
+                'react': { version: '18.3.1', wantedVersion: '18.3.1' },
+                'react-native': { version: '0.76.9', wantedVersion: '0.76.9' },
+              };
+            }
+
+            // Ensure core deps exist (Snack requires these)
+            if (!deps['expo']) deps['expo'] = { version: '~54.0.0', wantedVersion: '~54.0.0' };
+            if (!deps['react']) deps['react'] = { version: '18.3.1', wantedVersion: '18.3.1' };
+            if (!deps['react-native']) deps['react-native'] = { version: '0.76.9', wantedVersion: '0.76.9' };
 
             return deps;
           }
