@@ -7,7 +7,8 @@
 # 1. Creating/updating an Expo Snack from the repository
 # 2. Calling the Lumea webhook with the Snack URL
 #
-# Secrets are inherited from the lumea-apps organization:
+# Secrets required:
+# - EXPO_SESSION_SECRET: Expo session token for API authentication
 # - LUMEA_WEBHOOK_SECRET: Shared secret for webhook authentication
 #
 # @see SHO-122 - Mobile Preview via Snack
@@ -22,6 +23,8 @@ on:
         required: true
         type: string
     secrets:
+      EXPO_SESSION_SECRET:
+        required: true
       LUMEA_WEBHOOK_SECRET:
         required: true
 
@@ -37,117 +40,223 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Create Snack
+      - name: Deploy to Expo Snack
         id: snack
+        env:
+          EXPO_SESSION_SECRET: ${{ secrets.EXPO_SESSION_SECRET }}
         run: |
-          set -e
+          node --input-type=module << 'EOF'
+          import fs from 'fs';
+          import path from 'path';
 
-          # Read app name from package.json (with fallback)
-          if [ -f "package.json" ]; then
-            APP_NAME=$(node -e "console.log(require('./package.json').name || 'expo-app')")
-          else
-            APP_NAME="expo-app"
-          fi
-
-          echo "Creating Snack for: $APP_NAME"
-          echo "Repository: ${{ github.repository }}"
-          echo "Commit: ${{ github.sha }}"
-
-          # Create a Node.js script to build the Snack payload
-          cat > /tmp/create-snack.js << 'SCRIPT_EOF'
-          const fs = require('fs');
-          const path = require('path');
-
-          // Files to include in Snack
-          const files = {};
-
-          // Add a file to the payload
-          function addFile(filePath) {
-            if (fs.existsSync(filePath)) {
-              try {
-                const content = fs.readFileSync(filePath, 'utf8');
-                files[filePath] = { type: 'CODE', contents: content };
-              } catch (e) {
-                console.error(`Warning: Could not read ${filePath}:`, e.message);
-              }
-            }
+          const SESSION_SECRET = process.env.EXPO_SESSION_SECRET;
+          if (!SESSION_SECRET) {
+            console.error('EXPO_SESSION_SECRET not set');
+            process.exit(1);
           }
 
-          // Add key files
-          ['App.tsx', 'App.js', 'app.json', 'package.json', 'babel.config.js', 'tsconfig.json'].forEach(addFile);
+          const PROJECT_ROOT = process.cwd();
+          const SDK_VERSION = '52.0.0';
+          const SNACK_RUNTIME_ID = '933fd9c0-1666-11e7-afca-d980795c5824';
 
-          // Add files from common directories
-          const dirs = ['src', 'components', 'screens', 'hooks', 'utils', 'lib', 'app'];
-          let fileCount = 0;
-          const maxFiles = 50;
+          // Read app name from package.json
+          let appName = 'Lumea App';
+          let appDescription = 'Built with Lumea';
+          try {
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            appName = pkg.name || appName;
+            appDescription = pkg.description || appDescription;
+          } catch (e) {}
 
-          function scanDir(dir) {
-            if (!fs.existsSync(dir) || fileCount >= maxFiles) return;
+          // Patterns to ignore when scanning files
+          const IGNORE_PATTERNS = [
+            'node_modules', '.git', '.expo', 'dist', 'build', '.gitignore',
+            'bun.lock', 'package-lock.json', 'yarn.lock',
+            '.github', '__tests__', 'test', 'tests',
+          ];
+
+          // Supported file extensions
+          const SUPPORTED_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.json'];
+
+          // Files to exclude from code (handled separately or not needed)
+          const EXCLUDE_FILES = ['package.json', 'package-lock.json', 'tsconfig.json'];
+
+          function readFilesRecursively(dir, baseDir = dir) {
+            const files = {};
+
+            if (!fs.existsSync(dir)) return files;
+
             const entries = fs.readdirSync(dir, { withFileTypes: true });
+
             for (const entry of entries) {
-              if (fileCount >= maxFiles) break;
               const fullPath = path.join(dir, entry.name);
-              if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
-                scanDir(fullPath);
-              } else if (entry.isFile() && /\.(ts|tsx|js|jsx|json)$/.test(entry.name)) {
-                addFile(fullPath);
-                fileCount++;
+              const relativePath = path.relative(baseDir, fullPath);
+
+              if (IGNORE_PATTERNS.some(pattern => relativePath.includes(pattern))) continue;
+              if (EXCLUDE_FILES.includes(entry.name)) continue;
+
+              if (entry.isDirectory()) {
+                Object.assign(files, readFilesRecursively(fullPath, baseDir));
+              } else if (entry.isFile()) {
+                const ext = path.extname(entry.name);
+                if (SUPPORTED_EXTENSIONS.includes(ext)) {
+                  try {
+                    files[relativePath] = fs.readFileSync(fullPath, 'utf-8');
+                  } catch (e) {
+                    console.warn(`Warning: Could not read ${relativePath}`);
+                  }
+                }
               }
             }
+            return files;
           }
 
-          dirs.forEach(scanDir);
+          function prepareSnackFiles(files) {
+            const snackFiles = {};
 
-          // Read dependencies
-          let dependencies = {};
-          if (fs.existsSync('package.json')) {
+            // Handle App entry point
+            const appEntryPoints = ['App.tsx', 'App.jsx', 'App.js', 'src/App.tsx', 'src/App.jsx', 'src/App.js'];
+            let appEntryFound = false;
+
+            for (const entry of appEntryPoints) {
+              if (files[entry]) {
+                let content = files[entry];
+                // Normalize .jsx/.tsx imports to .js for Snack compatibility
+                content = content.replace(/\.(jsx|tsx)(['"])/g, '.js$2');
+                snackFiles['App.js'] = { type: 'CODE', contents: content };
+                delete files[entry];
+                appEntryFound = true;
+                break;
+              }
+            }
+
+            if (!appEntryFound) {
+              console.warn('Warning: No App entry point found');
+            }
+
+            // Process remaining files
+            for (const [filePath, content] of Object.entries(files)) {
+              let snackPath = filePath;
+
+              // Remove src/ prefix if present
+              if (snackPath.startsWith('src/')) {
+                snackPath = snackPath.replace('src/', '');
+              }
+
+              // Normalize extensions for Snack
+              snackPath = snackPath.replace(/\.(jsx|tsx)$/, '.js');
+
+              // Skip index/main entry files (App.js is the entry)
+              if (snackPath === 'index.js' || snackPath === 'main.js') continue;
+
+              snackFiles[snackPath] = {
+                type: 'CODE',
+                contents: content.replace(/\.(jsx|tsx)(['"])/g, '.js$2'),
+              };
+            }
+
+            return snackFiles;
+          }
+
+          function getDependencies() {
+            // Default Expo dependencies
+            const deps = {
+              'expo': { version: '~52.0.0', wantedVersion: '~52.0.0' },
+              'react': { version: '18.2.0', wantedVersion: '18.2.0' },
+              'react-native': { version: '0.76.0', wantedVersion: '0.76.0' },
+              'expo-status-bar': { version: '~2.0.0', wantedVersion: '~2.0.0' },
+            };
+
+            // Read additional dependencies from package.json
             try {
               const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-              dependencies = pkg.dependencies || {};
+              const pkgDeps = pkg.dependencies || {};
+
+              for (const [name, version] of Object.entries(pkgDeps)) {
+                // Skip core deps (already handled)
+                if (['expo', 'react', 'react-native'].includes(name)) continue;
+
+                deps[name] = { version: version, wantedVersion: version };
+              }
             } catch (e) {}
+
+            return deps;
           }
 
-          // Build Snack payload
-          const payload = {
-            name: process.argv[2] || 'expo-app',
-            description: `Deployed from ${process.argv[3] || 'Lumea'}`,
-            files: files,
-            dependencies: dependencies,
-            sdkVersion: '52.0.0'
-          };
+          function getManifestDependencies(deps) {
+            const manifestDeps = {};
+            for (const [name, info] of Object.entries(deps)) {
+              manifestDeps[name] = info.version;
+            }
+            return manifestDeps;
+          }
 
-          console.log(JSON.stringify(payload));
-          SCRIPT_EOF
+          async function createSnack() {
+            console.log('Reading project files...');
 
-          # Generate Snack payload
-          SNACK_PAYLOAD=$(node /tmp/create-snack.js "$APP_NAME" "${{ github.repository }}")
+            const rawFiles = readFilesRecursively(PROJECT_ROOT);
+            const code = prepareSnackFiles(rawFiles);
+            const dependencies = getDependencies();
 
-          # Save to Snack API
-          echo "Uploading to Snack API..."
-          RESPONSE=$(curl -s -X POST "https://snack.expo.dev/api/v2/snack/save" \
-            -H "Content-Type: application/json" \
-            -d "$SNACK_PAYLOAD")
+            console.log(`Found ${Object.keys(code).length} files to upload`);
+            console.log(`Files: ${Object.keys(code).join(', ')}`);
 
-          # Extract Snack ID from response
-          SNACK_ID=$(echo "$RESPONSE" | node -e "const d=require('fs').readFileSync(0,'utf8');try{console.log(JSON.parse(d).id||'')}catch{console.log('')}")
+            const payload = {
+              manifest: {
+                sdkVersion: SDK_VERSION,
+                name: appName,
+                description: appDescription,
+                dependencies: getManifestDependencies(dependencies),
+              },
+              code: code,
+              dependencies: dependencies,
+              isDraft: false,
+              save: true,
+            };
 
-          if [ -z "$SNACK_ID" ]; then
-            echo "Failed to create Snack"
-            echo "Response: $RESPONSE"
-            exit 1
-          fi
+            console.log('Uploading to Snack API...');
 
-          # Build Snack URLs
-          SNACK_WEB_URL="https://snack.expo.dev/$SNACK_ID"
-          SNACK_EXPO_URL="exp://exp.host/@snack/$SNACK_ID"
+            const response = await fetch('https://exp.host/--/api/v2/snack/save', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Expo-Session': SESSION_SECRET,
+              },
+              body: JSON.stringify(payload),
+            });
 
-          echo "snack_id=$SNACK_ID" >> $GITHUB_OUTPUT
-          echo "snack_url=$SNACK_EXPO_URL" >> $GITHUB_OUTPUT
-          echo "snack_web_url=$SNACK_WEB_URL" >> $GITHUB_OUTPUT
+            const result = await response.json();
 
-          echo "Snack created successfully!"
-          echo "Web URL: $SNACK_WEB_URL"
-          echo "Expo URL: $SNACK_EXPO_URL"
+            if (result.id || result.hashId) {
+              const snackId = result.id || result.hashId;
+              const webUrl = `https://snack.expo.dev/${snackId}`;
+              const expoGoUrl = `exp://u.expo.dev/${SNACK_RUNTIME_ID}?runtime-version=exposdk:${SDK_VERSION}&channel-name=production&snack=${snackId}`;
+
+              console.log('');
+              console.log('Snack deployed successfully!');
+              console.log(`Web URL: ${webUrl}`);
+              console.log(`Expo Go URL: ${expoGoUrl}`);
+
+              // Set GitHub Actions outputs
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `snack_id=${snackId}\n`);
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `snack_url=${expoGoUrl}\n`);
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `snack_web_url=${webUrl}\n`);
+
+              return;
+            }
+
+            // Handle errors
+            console.error('Failed to create Snack');
+            if (result.errors) {
+              console.error('Errors:', JSON.stringify(result.errors, null, 2));
+            } else {
+              console.error('Response:', JSON.stringify(result, null, 2));
+            }
+            process.exit(1);
+          }
+
+          createSnack();
+          EOF
 
       - name: Notify Lumea (Success)
         if: success()
@@ -160,6 +269,7 @@ jobs:
               "type": "mobile",
               "status": "ready",
               "snackUrl": "${{ steps.snack.outputs.snack_url }}",
+              "snackWebUrl": "${{ steps.snack.outputs.snack_web_url }}",
               "snackId": "${{ steps.snack.outputs.snack_id }}",
               "commitSha": "${{ github.sha }}"
             }'
@@ -177,3 +287,12 @@ jobs:
               "error": "Failed to create Snack",
               "commitSha": "${{ github.sha }}"
             }'
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "## 📱 Expo Snack Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Web URL:** ${{ steps.snack.outputs.snack_web_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Expo Go URL:** \`${{ steps.snack.outputs.snack_url }}\`" >> $GITHUB_STEP_SUMMARY
