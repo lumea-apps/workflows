@@ -41,6 +41,11 @@ on:
         required: false
         type: string
         default: 'all'
+      badge:
+        description: 'Show "Built with Lumea" badge on deployed site (true/false)'
+        required: false
+        type: string
+        default: 'true'
     # Secrets are inherited from org level via `secrets: inherit`
     secrets:
       VERCEL_TOKEN:
@@ -138,6 +143,77 @@ jobs:
           echo "Environment variables sync complete"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Inject Lumea Badge
+        if: inputs.badge == 'true'
+        continue-on-error: true  # Badge is optional - don't fail deploy if injection fails
+        run: |
+          echo "Injecting Lumea badge into Next.js layout..."
+
+          # Find the layout file (App Router)
+          LAYOUT_FILE=""
+          if [ -f "app/layout.tsx" ]; then
+            LAYOUT_FILE="app/layout.tsx"
+          elif [ -f "app/layout.js" ]; then
+            LAYOUT_FILE="app/layout.js"
+          elif [ -f "src/app/layout.tsx" ]; then
+            LAYOUT_FILE="src/app/layout.tsx"
+          elif [ -f "src/app/layout.js" ]; then
+            LAYOUT_FILE="src/app/layout.js"
+          fi
+
+          if [ -z "$LAYOUT_FILE" ]; then
+            echo "⚠ No layout file found, skipping badge injection"
+            exit 0
+          fi
+
+          echo "Found layout file: $LAYOUT_FILE"
+
+          # Check if Script is already imported
+          if ! grep -q "from ['\"]next/script['\"]" "$LAYOUT_FILE"; then
+            # Create a temp file with the import added after the first import line
+            # This handles both regular imports and "use client" directives
+            awk '
+              /^import / && !added {
+                print
+                print "import Script from \"next/script\";"
+                added = 1
+                next
+              }
+              { print }
+            ' "$LAYOUT_FILE" > "${LAYOUT_FILE}.tmp" && mv "${LAYOUT_FILE}.tmp" "$LAYOUT_FILE"
+            echo "✓ Added Script import"
+          else
+            echo "✓ Script import already exists"
+          fi
+
+          # Add the Script component before </body>
+          # Use a unique marker to avoid duplicate injections
+          if ! grep -q "lumea.dev/badge.js" "$LAYOUT_FILE"; then
+            # Insert Script component before </body>
+            sed -i 's|</body>|<Script src="https://lumea.dev/badge.js" strategy="lazyOnload" /></body>|' "$LAYOUT_FILE"
+            echo "✓ Added badge Script component"
+          else
+            echo "✓ Badge script already present"
+          fi
+
+          echo "Badge injection complete"
+          echo "--- Modified layout.tsx ---"
+          cat "$LAYOUT_FILE"
+          echo "----------------------------"
+
+          # Quick TypeScript check to catch errors early
+          if command -v npx &> /dev/null && [ -f "tsconfig.json" ]; then
+            echo "Running TypeScript check..."
+            if ! npx tsc --noEmit --skipLibCheck 2>&1; then
+              echo "⚠ TypeScript error detected after badge injection"
+              echo "Reverting changes..."
+              git checkout -- "$LAYOUT_FILE" 2>/dev/null || true
+              echo "Badge injection reverted - deploy will continue without badge"
+              exit 0
+            fi
+            echo "✓ TypeScript check passed"
+          fi
 
       - name: Build with Vercel
         id: build
