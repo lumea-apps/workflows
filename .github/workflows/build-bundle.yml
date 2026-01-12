@@ -1,0 +1,208 @@
+# Reusable Workflow: Build React Native Bundle
+#
+# This workflow builds a React Native bundle for native preview
+# and uploads it to Cloudflare R2 for CDN delivery.
+#
+# The bundle can be loaded by Lumea Mobile app using
+# @callstack/react-native-sandbox for isolated execution.
+#
+# Secrets required:
+# - R2_ACCOUNT_ID: Cloudflare account ID
+# - R2_ACCESS_KEY_ID: R2 access key
+# - R2_SECRET_ACCESS_KEY: R2 secret key
+# - LUMEA_WEBHOOK_SECRET: Shared secret for webhook authentication
+#
+# @see SHO-122 - Mobile Preview Strategy
+
+name: Build Native Bundle
+
+on:
+  workflow_call:
+    inputs:
+      lumea_project_id:
+        description: 'Lumea Project ID'
+        required: true
+        type: string
+    secrets:
+      R2_ACCOUNT_ID:
+        required: true
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+      LUMEA_WEBHOOK_SECRET:
+        required: true
+
+env:
+  R2_BUCKET: lumea-bundles
+  R2_PUBLIC_URL: https://bundles.lumea.dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build iOS Bundle
+        id: build
+        run: |
+          # Create output directory
+          mkdir -p dist/ios
+
+          # Build the bundle using Metro
+          npx react-native bundle \
+            --platform ios \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output dist/ios/main.jsbundle \
+            --assets-dest dist/ios/assets \
+            --minify true
+
+          # Calculate bundle size
+          BUNDLE_SIZE=$(stat -c%s dist/ios/main.jsbundle 2>/dev/null || stat -f%z dist/ios/main.jsbundle)
+          echo "bundle_size=$BUNDLE_SIZE" >> $GITHUB_OUTPUT
+          echo "Bundle size: $BUNDLE_SIZE bytes"
+
+          # Generate bundle hash for cache busting
+          BUNDLE_HASH=$(sha256sum dist/ios/main.jsbundle | cut -c1-8)
+          echo "bundle_hash=$BUNDLE_HASH" >> $GITHUB_OUTPUT
+
+      - name: Upload to R2
+        id: upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+        run: |
+          PROJECT_ID="${{ inputs.lumea_project_id }}"
+          COMMIT_SHA="${{ github.sha }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+
+          # R2 endpoint
+          R2_ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+
+          # Upload bundle
+          # Path: bundles/{projectId}/{shortSha}/main.jsbundle
+          BUNDLE_KEY="bundles/${PROJECT_ID}/${SHORT_SHA}/main.jsbundle"
+
+          aws s3 cp dist/ios/main.jsbundle "s3://${R2_BUCKET}/${BUNDLE_KEY}" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "application/javascript" \
+            --cache-control "public, max-age=31536000, immutable"
+
+          # Upload assets if they exist
+          if [ -d "dist/ios/assets" ] && [ "$(ls -A dist/ios/assets 2>/dev/null)" ]; then
+            aws s3 sync dist/ios/assets "s3://${R2_BUCKET}/bundles/${PROJECT_ID}/${SHORT_SHA}/assets/" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --cache-control "public, max-age=31536000, immutable"
+          fi
+
+          # Also upload to 'latest' path for easy access
+          LATEST_KEY="bundles/${PROJECT_ID}/latest/main.jsbundle"
+          aws s3 cp dist/ios/main.jsbundle "s3://${R2_BUCKET}/${LATEST_KEY}" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "application/javascript" \
+            --cache-control "public, max-age=60"
+
+          if [ -d "dist/ios/assets" ] && [ "$(ls -A dist/ios/assets 2>/dev/null)" ]; then
+            aws s3 sync dist/ios/assets "s3://${R2_BUCKET}/bundles/${PROJECT_ID}/latest/assets/" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --cache-control "public, max-age=60"
+          fi
+
+          # Generate public URLs
+          BUNDLE_URL="${R2_PUBLIC_URL}/${BUNDLE_KEY}"
+          LATEST_URL="${R2_PUBLIC_URL}/${LATEST_KEY}"
+
+          echo "bundle_url=${BUNDLE_URL}" >> $GITHUB_OUTPUT
+          echo "latest_url=${LATEST_URL}" >> $GITHUB_OUTPUT
+
+          echo "Uploaded bundle to: ${BUNDLE_URL}"
+          echo "Latest URL: ${LATEST_URL}"
+
+      - name: Create manifest
+        id: manifest
+        run: |
+          PROJECT_ID="${{ inputs.lumea_project_id }}"
+          COMMIT_SHA="${{ github.sha }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+
+          # Create manifest JSON
+          cat > dist/manifest.json << EOF
+          {
+            "projectId": "${PROJECT_ID}",
+            "commitSha": "${COMMIT_SHA}",
+            "shortSha": "${SHORT_SHA}",
+            "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "bundleSize": ${{ steps.build.outputs.bundle_size }},
+            "bundleHash": "${{ steps.build.outputs.bundle_hash }}",
+            "bundles": {
+              "ios": "${{ steps.upload.outputs.bundle_url }}"
+            },
+            "latestUrl": "${{ steps.upload.outputs.latest_url }}"
+          }
+          EOF
+
+          cat dist/manifest.json
+
+          # Upload manifest
+          R2_ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          aws s3 cp dist/manifest.json "s3://${R2_BUCKET}/bundles/${PROJECT_ID}/manifest.json" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "application/json" \
+            --cache-control "public, max-age=60"
+
+      - name: Notify Lumea (Success)
+        if: success()
+        run: |
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -d '{
+              "projectId": "${{ inputs.lumea_project_id }}",
+              "type": "bundle",
+              "status": "ready",
+              "bundleUrl": "${{ steps.upload.outputs.latest_url }}",
+              "bundleSize": ${{ steps.build.outputs.bundle_size }},
+              "bundleHash": "${{ steps.build.outputs.bundle_hash }}",
+              "commitSha": "${{ github.sha }}"
+            }'
+
+      - name: Notify Lumea (Failure)
+        if: failure()
+        run: |
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -d '{
+              "projectId": "${{ inputs.lumea_project_id }}",
+              "type": "bundle",
+              "status": "error",
+              "error": "Failed to build native bundle",
+              "commitSha": "${{ github.sha }}"
+            }'
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "## 📦 Native Bundle Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Bundle URL:** \`${{ steps.upload.outputs.latest_url }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Size:** $(numfmt --to=iec-i --suffix=B ${{ steps.build.outputs.bundle_size }} 2>/dev/null || echo '${{ steps.build.outputs.bundle_size }} bytes')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Hash:** \`${{ steps.build.outputs.bundle_hash }}\`" >> $GITHUB_STEP_SUMMARY

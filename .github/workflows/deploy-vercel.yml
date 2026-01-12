@@ -58,7 +58,7 @@ on:
         required: false
 
 env:
-  PLATFORM_DOMAIN: lumea-ai.app
+  PLATFORM_DOMAIN: buildwithlumea.dev
 
 jobs:
   deploy:
@@ -189,10 +189,11 @@ jobs:
 
           # Add the Script component before </body>
           # Use a unique marker to avoid duplicate injections
+          # Include data-project-id for runtime API visibility check
           if ! grep -q "lumea.dev/badge.js" "$LAYOUT_FILE"; then
-            # Insert Script component before </body>
-            sed -i 's|</body>|<Script src="https://lumea.dev/badge.js" strategy="lazyOnload" /></body>|' "$LAYOUT_FILE"
-            echo "✓ Added badge Script component"
+            # Insert Script component before </body> with project ID for API check
+            sed -i 's|</body>|<Script src="https://lumea.dev/badge.js" data-project-id="${{ inputs.lumea_project_id }}" strategy="lazyOnload" /></body>|' "$LAYOUT_FILE"
+            echo "✓ Added badge Script component with project ID: ${{ inputs.lumea_project_id }}"
           else
             echo "✓ Badge script already present"
           fi
