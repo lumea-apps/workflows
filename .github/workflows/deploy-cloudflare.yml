@@ -1,23 +1,20 @@
-# Reusable Workflow: Deploy to Cloudflare Pages
+# Reusable Workflow: Deploy to Cloudflare (Full-Stack)
 #
-# This workflow should be placed in the lumea-apps/workflows repository
-# at .github/workflows/deploy-cloudflare.yml
-#
-# It handles:
-# 1. Building the Vite/React project
-# 2. Deploying to Cloudflare Pages via Wrangler
-# 3. Configuring custom domains (if provided)
-# 4. Calling the Lumea webhook with results
+# This workflow handles full-stack deployment:
+# 1. Job deploy-api: Provisions Neon DB + deploys Hono Worker
+# 2. Job deploy: Builds frontend with API URL + deploys to Pages
 #
 # Secrets required:
-# - CLOUDFLARE_API_TOKEN: Cloudflare API token with Pages permissions
+# - CLOUDFLARE_API_TOKEN: Cloudflare API token with Pages + Workers permissions
 # - CLOUDFLARE_ACCOUNT_ID: Cloudflare account ID
+# - NEON_API_KEY: Neon API key for database provisioning
+# - NEON_PROJECT_ID: Neon project ID
 # - LUMEA_WEBHOOK_SECRET: Shared secret for webhook authentication
 # - PROJECT_SECRETS: JSON with project environment variables (optional)
 #
-# Used for: react-ts-fullstack template (Vite + React on CF Pages)
+# Used for: react-ts-fullstack template (Vite + Hono on CF)
 
-name: Deploy to Cloudflare Pages
+name: Deploy to Cloudflare (Full-Stack)
 
 on:
   workflow_call:
@@ -50,6 +47,8 @@ on:
         required: true
       CLOUDFLARE_ACCOUNT_ID:
         required: true
+      NEON_API_KEY:
+        required: true
       LUMEA_WEBHOOK_SECRET:
         required: true
       PROJECT_SECRETS:
@@ -60,8 +59,237 @@ env:
   CLOUDFLARE_ZONE_ID: fd6d42c5b39e410ef8326140eafee409
 
 jobs:
+  # ============================================================================
+  # Job 1: Deploy Backend (Cloudflare Workers + Neon DB)
+  # ============================================================================
+  deploy-api:
+    runs-on: ubuntu-latest
+    outputs:
+      api_url: ${{ steps.deploy.outputs.api_url }}
+      neon_project_name: ${{ steps.neon.outputs.neon_project_name }}
+      worker_name: ${{ steps.deploy.outputs.worker_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Install Wrangler CLI
+        run: npm install -g wrangler
+
+      # --------------------------------------------------------------------
+      # Neon Project Provisioning (Lazy - one project per app)
+      # --------------------------------------------------------------------
+      - name: Provision Neon Project
+        id: neon
+        run: |
+          LUMEA_PROJECT_ID="${{ inputs.lumea_project_id }}"
+          # Neon project name based on Lumea project ID
+          NEON_PROJECT_NAME="lumea-${LUMEA_PROJECT_ID}"
+
+          echo "Checking if Neon project $NEON_PROJECT_NAME exists..."
+
+          # List existing projects to check if ours exists
+          PROJECTS=$(curl -s -X GET \
+            "https://console.neon.tech/api/v2/projects" \
+            -H "Authorization: Bearer ${{ secrets.NEON_API_KEY }}" \
+            -H "Accept: application/json")
+
+          # Check if our project exists (by name)
+          EXISTING_PROJECT=$(echo "$PROJECTS" | jq -r ".projects[]? | select(.name == \"$NEON_PROJECT_NAME\")")
+          NEON_PROJECT_ID=$(echo "$EXISTING_PROJECT" | jq -r '.id // empty')
+
+          if [ -z "$NEON_PROJECT_ID" ]; then
+            echo "Neon project does not exist, creating..."
+
+            # Create new Neon project
+            CREATE_RESULT=$(curl -s -X POST \
+              "https://console.neon.tech/api/v2/projects" \
+              -H "Authorization: Bearer ${{ secrets.NEON_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -d "{
+                \"project\": {
+                  \"name\": \"$NEON_PROJECT_NAME\",
+                  \"region_id\": \"aws-us-east-1\",
+                  \"pg_version\": 17
+                }
+              }")
+
+            # Check for errors
+            ERROR=$(echo "$CREATE_RESULT" | jq -r '.message // empty')
+            if [ -n "$ERROR" ]; then
+              echo "::error::Failed to create Neon project: $ERROR"
+              echo "$CREATE_RESULT"
+              exit 1
+            fi
+
+            NEON_PROJECT_ID=$(echo "$CREATE_RESULT" | jq -r '.project.id // empty')
+
+            if [ -z "$NEON_PROJECT_ID" ]; then
+              echo "::error::Failed to get project ID from response"
+              echo "$CREATE_RESULT"
+              exit 1
+            fi
+
+            # Get connection URI from creation response
+            DATABASE_URL=$(echo "$CREATE_RESULT" | jq -r '.connection_uris[0].connection_uri // empty')
+
+            echo "✅ Neon project created: $NEON_PROJECT_NAME (ID: $NEON_PROJECT_ID)"
+          else
+            echo "✅ Neon project already exists: $NEON_PROJECT_NAME (ID: $NEON_PROJECT_ID)"
+
+            # Get connection URI from existing project
+            PROJECT_INFO=$(curl -s -X GET \
+              "https://console.neon.tech/api/v2/projects/$NEON_PROJECT_ID" \
+              -H "Authorization: Bearer ${{ secrets.NEON_API_KEY }}" \
+              -H "Accept: application/json")
+
+            DATABASE_URL=$(echo "$PROJECT_INFO" | jq -r '.project.connection_uris[0].connection_uri // empty')
+          fi
+
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::Could not get connection URI from Neon project"
+            exit 1
+          fi
+
+          echo "neon_project_id=$NEON_PROJECT_ID" >> $GITHUB_OUTPUT
+          echo "neon_project_name=$NEON_PROJECT_NAME" >> $GITHUB_OUTPUT
+          echo "database_url=$DATABASE_URL" >> $GITHUB_OUTPUT
+          echo "::add-mask::$DATABASE_URL"
+
+          echo "📍 Database URL retrieved successfully"
+
+      # --------------------------------------------------------------------
+      # Create .dev.vars for Worker secrets
+      # --------------------------------------------------------------------
+      - name: Create Worker secrets file
+        working-directory: server
+        run: |
+          SECRETS='${{ secrets.PROJECT_SECRETS }}'
+
+          # Start with DATABASE_URL
+          echo "DATABASE_URL=${{ steps.neon.outputs.database_url }}" > .dev.vars
+
+          if [ -n "$SECRETS" ] && [ "$SECRETS" != "" ]; then
+            echo "Adding project secrets to .dev.vars..."
+            # Filter for 'api' and 'all' targets
+            echo "$SECRETS" | jq -r '
+              ((.all // {}) + ((.api // {})))
+              | to_entries[]
+              | "\(.key)=\(.value)"
+            ' >> .dev.vars 2>/dev/null || true
+          fi
+
+      # --------------------------------------------------------------------
+      # Deploy Worker
+      # --------------------------------------------------------------------
+      - name: Deploy Worker
+        id: deploy
+        working-directory: server
+        run: |
+          # Worker name includes both slug and project ID for uniqueness
+          WORKER_NAME="lumea-api-${{ inputs.project_slug }}-${{ inputs.lumea_project_id }}"
+
+          # Truncate if too long (Cloudflare limit is 63 chars)
+          if [ ${#WORKER_NAME} -gt 63 ]; then
+            WORKER_NAME="${WORKER_NAME:0:63}"
+          fi
+
+          echo "Deploying Worker: $WORKER_NAME"
+
+          # Deploy with wrangler
+          npx wrangler deploy \
+            --name "$WORKER_NAME" \
+            --compatibility-date "2024-01-01" \
+            2>&1 | tee deploy_output.txt
+
+          # Check if deploy succeeded
+          if [ $? -ne 0 ]; then
+            echo "::error::Worker deployment failed"
+            cat deploy_output.txt
+            exit 1
+          fi
+
+          # API URL is deterministic (includes project ID for security)
+          API_URL="https://api-${{ inputs.project_slug }}-${{ inputs.lumea_project_id }}.${{ env.PLATFORM_DOMAIN }}"
+
+          echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+          echo "worker_name=$WORKER_NAME" >> $GITHUB_OUTPUT
+
+          echo "✅ Worker deployed: $WORKER_NAME"
+          echo "📍 API URL will be: $API_URL"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --------------------------------------------------------------------
+      # Configure Custom Domain for Worker
+      # --------------------------------------------------------------------
+      - name: Configure Worker Custom Domain
+        run: |
+          WORKER_NAME="${{ steps.deploy.outputs.worker_name }}"
+          SUBDOMAIN="api-${{ inputs.project_slug }}-${{ inputs.lumea_project_id }}"
+          FULL_DOMAIN="${SUBDOMAIN}.${{ env.PLATFORM_DOMAIN }}"
+
+          echo "Configuring custom domain: $FULL_DOMAIN for worker: $WORKER_NAME"
+
+          # First, create DNS record (CNAME to workers.dev)
+          WORKERS_DEV_DOMAIN="${WORKER_NAME}.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
+
+          # Check if DNS record exists
+          EXISTING_DNS=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records?type=CNAME&name=$FULL_DOMAIN" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          RECORD_ID=$(echo "$EXISTING_DNS" | jq -r '.result[0].id // empty')
+
+          if [ -n "$RECORD_ID" ]; then
+            echo "Updating existing DNS record..."
+            curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$WORKERS_DEV_DOMAIN\",\"ttl\":1,\"proxied\":true}"
+          else
+            echo "Creating new DNS record..."
+            curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records" \
+              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$WORKERS_DEV_DOMAIN\",\"ttl\":1,\"proxied\":true}"
+          fi
+
+          # Add custom domain to worker
+          echo "Adding custom domain to worker..."
+          curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/$WORKER_NAME/domains" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"hostname\":\"$FULL_DOMAIN\"}" || true
+
+          echo "✅ Custom domain configured: $FULL_DOMAIN"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+  # ============================================================================
+  # Job 2: Deploy Frontend (Cloudflare Pages)
+  # ============================================================================
   deploy:
     runs-on: ubuntu-latest
+    needs: deploy-api
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,19 +315,22 @@ jobs:
           SECRETS='${{ secrets.PROJECT_SECRETS }}'
           TARGET="${{ inputs.app_target }}"
 
+          # Start with API URL from deploy-api job
+          echo "VITE_API_URL=${{ needs.deploy-api.outputs.api_url }}" > .env
+
           if [ -z "$SECRETS" ] || [ "$SECRETS" = "" ]; then
-            echo "No project secrets configured, skipping .env creation"
+            echo "No project secrets configured, using only VITE_API_URL"
             exit 0
           fi
 
           echo "Creating .env file for target: $TARGET"
 
-          # Combine "all" target with specific target
+          # Combine "all" target with specific target (web)
           echo "$SECRETS" | jq -r "
-            ((.all // {}) + (.[\"$TARGET\"] // {}))
+            ((.all // {}) + (.[\"$TARGET\"] // {}) + (.web // {}))
             | to_entries[]
             | \"\(.key)=\(.value)\"
-          " > .env
+          " >> .env
 
           echo "Environment variables written to .env"
 
@@ -148,9 +379,10 @@ jobs:
           fi
         env:
           NODE_ENV: production
+          VITE_API_URL: ${{ needs.deploy-api.outputs.api_url }}
 
       - name: Deploy to Cloudflare Pages
-        id: deploy
+        id: pages_deploy
         run: |
           PROJECT_NAME="lumea-${{ inputs.project_slug }}"
           BUILD_DIR="${{ steps.build.outputs.build_dir }}"
@@ -189,13 +421,12 @@ jobs:
       - name: Configure Platform Domain
         id: platform_domain
         run: |
-          PROJECT_NAME="${{ steps.deploy.outputs.project_name }}"
+          PROJECT_NAME="${{ steps.pages_deploy.outputs.project_name }}"
           SUBDOMAIN="${{ inputs.project_slug }}.${{ env.PLATFORM_DOMAIN }}"
 
           echo "Adding platform subdomain: $SUBDOMAIN to project: $PROJECT_NAME"
 
           # Add platform subdomain to Cloudflare Pages project
-          # This will be "pending" until DNS is migrated to Cloudflare
           RESULT=$(curl -s -X POST \
             "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/pages/projects/$PROJECT_NAME/domains" \
             -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
@@ -208,18 +439,16 @@ jobs:
           if [ "$SUCCESS" = "true" ]; then
             echo "Platform subdomain added successfully"
           else
-            # Domain might already exist, which is fine
             echo "Platform subdomain may already be configured"
           fi
 
-          # Use platform subdomain as primary domain
           echo "platform_domain=$SUBDOMAIN" >> $GITHUB_OUTPUT
 
       - name: Create DNS Record
         id: dns_record
         run: |
           SUBDOMAIN="${{ inputs.project_slug }}"
-          PAGES_DOMAIN="${{ steps.deploy.outputs.pages_domain }}"
+          PAGES_DOMAIN="${{ steps.pages_deploy.outputs.pages_domain }}"
 
           echo "Creating CNAME record: $SUBDOMAIN.${{ env.PLATFORM_DOMAIN }} → $PAGES_DOMAIN"
 
@@ -237,14 +466,14 @@ jobs:
               "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records/$RECORD_ID" \
               -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
               -H "Content-Type: application/json" \
-              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$PAGES_DOMAIN\",\"ttl\":1,\"proxied\":false}")
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$PAGES_DOMAIN\",\"ttl\":1,\"proxied\":true}")
           else
             echo "Creating new record..."
             RESULT=$(curl -s -X POST \
               "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records" \
               -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
               -H "Content-Type: application/json" \
-              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$PAGES_DOMAIN\",\"ttl\":1,\"proxied\":false}")
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$PAGES_DOMAIN\",\"ttl\":1,\"proxied\":true}")
           fi
 
           echo "$RESULT"
@@ -261,7 +490,7 @@ jobs:
         if: inputs.custom_domain != ''
         run: |
           CUSTOM_DOMAIN="${{ inputs.custom_domain }}"
-          PROJECT_NAME="${{ steps.deploy.outputs.project_name }}"
+          PROJECT_NAME="${{ steps.pages_deploy.outputs.project_name }}"
 
           echo "Configuring custom domain: $CUSTOM_DOMAIN for project: $PROJECT_NAME"
 
@@ -274,7 +503,6 @@ jobs:
 
           echo "$RESULT"
 
-          # Check if domain was added successfully or already exists
           SUCCESS=$(echo "$RESULT" | jq -r '.success // false')
 
           if [ "$SUCCESS" = "true" ]; then
@@ -301,15 +529,18 @@ jobs:
           {
             "projectId": "${{ inputs.lumea_project_id }}",
             "status": "ready",
-            "deploymentUrl": "${{ steps.deploy.outputs.deployment_url }}",
-            "platformDomain": "${{ steps.platform_domain.outputs.platform_domain }}",
+            "deploymentUrl": "https://${{ steps.platform_domain.outputs.platform_domain }}",
+            "apiUrl": "${{ needs.deploy-api.outputs.api_url }}",
             "workflowRunId": "${{ github.run_id }}",
             "commitSha": "${{ github.sha }}",
             "logsUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
             "deploymentConfig": {
               "provider": "cloudflare",
-              "projectName": "${{ steps.deploy.outputs.project_name }}",
-              "pagesDomain": "${{ steps.deploy.outputs.pages_domain }}"
+              "type": "fullstack",
+              "projectName": "${{ steps.pages_deploy.outputs.project_name }}",
+              "pagesDomain": "${{ steps.pages_deploy.outputs.pages_domain }}",
+              "workerName": "${{ needs.deploy-api.outputs.worker_name }}",
+              "neonProjectName": "${{ needs.deploy-api.outputs.neon_project_name }}"
             }
           EOF
           )
