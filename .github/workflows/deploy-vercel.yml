@@ -56,9 +56,13 @@ on:
         required: true
       PROJECT_SECRETS:
         required: false
+      # Cloudflare credentials for DNS record management
+      CLOUDFLARE_API_TOKEN:
+        required: true
 
 env:
   PLATFORM_DOMAIN: builtwithlumea.dev
+  CLOUDFLARE_ZONE_ID: fd6d42c5b39e410ef8326140eafee409
 
 jobs:
   deploy:
@@ -253,6 +257,50 @@ jobs:
             --scope=${{ secrets.VERCEL_ORG_ID }} 2>&1 || echo "Platform domain alias may already exist"
 
           echo "platform_domain=$PLATFORM_DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Create Cloudflare DNS Record
+        id: cloudflare_dns
+        run: |
+          SUBDOMAIN="${{ inputs.project_slug }}"
+
+          echo "Creating/updating CNAME record: $SUBDOMAIN.${{ env.PLATFORM_DOMAIN }} → cname.vercel-dns.com"
+
+          # Check if record already exists
+          EXISTING=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records?type=CNAME&name=$SUBDOMAIN.${{ env.PLATFORM_DOMAIN }}" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          RECORD_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
+
+          if [ -n "$RECORD_ID" ]; then
+            echo "Record exists (ID: $RECORD_ID), updating..."
+            # Update existing record
+            RESULT=$(curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"cname.vercel-dns.com\",\"ttl\":1,\"proxied\":false}")
+          else
+            echo "Creating new record..."
+            # Create new record
+            RESULT=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records" \
+              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"cname.vercel-dns.com\",\"ttl\":1,\"proxied\":false}")
+          fi
+
+          echo "$RESULT"
+
+          SUCCESS=$(echo "$RESULT" | jq -r '.success // false')
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ DNS record configured successfully"
+            echo "dns_configured=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ DNS record configuration failed (may already exist with different settings)"
+            echo "dns_configured=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure Custom Domain
         id: custom_domain

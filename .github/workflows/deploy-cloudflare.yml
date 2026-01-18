@@ -188,11 +188,31 @@ jobs:
       - name: Configure Platform Domain
         id: platform_domain
         run: |
-          # For now, use the pages.dev domain as platform domain
-          # TODO: Configure custom subdomain on builtwithlumea.dev via Cloudflare
-          PLATFORM_DOMAIN="${{ steps.deploy.outputs.pages_domain }}"
-          echo "Platform domain: $PLATFORM_DOMAIN"
-          echo "platform_domain=$PLATFORM_DOMAIN" >> $GITHUB_OUTPUT
+          PROJECT_NAME="${{ steps.deploy.outputs.project_name }}"
+          SUBDOMAIN="${{ inputs.project_slug }}.${{ env.PLATFORM_DOMAIN }}"
+
+          echo "Adding platform subdomain: $SUBDOMAIN to project: $PROJECT_NAME"
+
+          # Add platform subdomain to Cloudflare Pages project
+          # This will be "pending" until DNS is migrated to Cloudflare
+          RESULT=$(curl -s -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/pages/projects/$PROJECT_NAME/domains" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"$SUBDOMAIN\"}" 2>&1) || true
+
+          echo "$RESULT"
+
+          SUCCESS=$(echo "$RESULT" | jq -r '.success // false')
+          if [ "$SUCCESS" = "true" ]; then
+            echo "Platform subdomain added successfully"
+          else
+            # Domain might already exist, which is fine
+            echo "Platform subdomain may already be configured"
+          fi
+
+          # Use platform subdomain as primary domain
+          echo "platform_domain=$SUBDOMAIN" >> $GITHUB_OUTPUT
 
       - name: Configure Custom Domain
         id: custom_domain
