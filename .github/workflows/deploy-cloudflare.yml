@@ -102,11 +102,14 @@ jobs:
 
           echo "Checking if Neon project $NEON_PROJECT_NAME exists..."
 
-          # List existing projects to check if ours exists
+          # List existing projects in the organization
+          # IMPORTANT: Must filter by org_id to find org projects, not personal projects
           PROJECTS=$(curl -s -X GET \
-            "https://console.neon.tech/api/v2/projects" \
+            "https://console.neon.tech/api/v2/projects?org_id=${{ secrets.NEON_ORG_ID }}" \
             -H "Authorization: Bearer ${{ secrets.NEON_API_KEY }}" \
             -H "Accept: application/json")
+
+          echo "Found $(echo "$PROJECTS" | jq '.projects | length') projects in org"
 
           # Check if our project exists (by name)
           EXISTING_PROJECT=$(echo "$PROJECTS" | jq -r ".projects[]? | select(.name == \"$NEON_PROJECT_NAME\")")
