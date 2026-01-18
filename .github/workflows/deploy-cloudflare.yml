@@ -267,35 +267,27 @@ jobs:
 
           echo "Configuring custom domain: $FULL_DOMAIN for worker: $WORKER_NAME"
 
-          # First, create DNS record (CNAME to workers.dev)
-          WORKERS_DEV_DOMAIN="${WORKER_NAME}.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
-
-          # Check if DNS record exists
+          # Delete any existing CNAME record that might conflict
+          # Workers Custom Domains manages DNS internally, so we don't need a CNAME
           EXISTING_DNS=$(curl -s -X GET \
-            "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records?type=CNAME&name=$FULL_DOMAIN" \
+            "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records?name=$FULL_DOMAIN" \
             -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json")
 
           RECORD_ID=$(echo "$EXISTING_DNS" | jq -r '.result[0].id // empty')
 
           if [ -n "$RECORD_ID" ]; then
-            echo "Updating existing DNS record..."
-            curl -s -X PUT \
+            echo "Deleting existing DNS record to avoid CNAME cross-user conflict..."
+            curl -s -X DELETE \
               "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records/$RECORD_ID" \
               -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$WORKERS_DEV_DOMAIN\",\"ttl\":1,\"proxied\":true}"
-          else
-            echo "Creating new DNS record..."
-            curl -s -X POST \
-              "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records" \
-              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$WORKERS_DEV_DOMAIN\",\"ttl\":1,\"proxied\":true}"
+              -H "Content-Type: application/json"
+            echo "Existing DNS record deleted"
           fi
 
-          # Add custom domain to worker using Workers Custom Domains API
-          echo "Adding custom domain to worker..."
+          # Use Workers Custom Domains API (handles DNS automatically)
+          # No CNAME needed - this avoids Error 1014 (CNAME Cross-User Banned)
+          echo "Adding custom domain to worker via Workers Custom Domains API..."
           DOMAIN_RESULT=$(curl -s -X PUT \
             "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/domains" \
             -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
@@ -315,8 +307,8 @@ jobs:
             echo "✅ Custom domain configured: $FULL_DOMAIN"
           else
             ERROR_MSG=$(echo "$DOMAIN_RESULT" | jq -r '.errors[0].message // "Unknown error"')
-            echo "⚠️ Custom domain configuration: $ERROR_MSG"
-            # Don't fail - DNS CNAME is already set up as fallback
+            echo "::error::Custom domain configuration failed: $ERROR_MSG"
+            exit 1
           fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
