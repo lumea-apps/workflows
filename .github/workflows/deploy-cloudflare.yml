@@ -287,6 +287,23 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
+      # --------------------------------------------------------------------
+      # Notify Lumea on API deployment failure
+      # --------------------------------------------------------------------
+      - name: Notify Lumea (API Failure)
+        if: failure()
+        run: |
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -d '{
+              "projectId": "${{ inputs.lumea_project_id }}",
+              "status": "error",
+              "error": "API deployment failed (Neon or Worker)",
+              "workflowRunId": "${{ github.run_id }}",
+              "logsUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
+
   # ============================================================================
   # Job 2: Deploy Frontend (Cloudflare Pages)
   # ============================================================================
