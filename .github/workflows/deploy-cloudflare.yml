@@ -57,6 +57,7 @@ on:
 
 env:
   PLATFORM_DOMAIN: builtwithlumea.dev
+  CLOUDFLARE_ZONE_ID: fd6d42c5b39e410ef8326140eafee409
 
 jobs:
   deploy:
@@ -213,6 +214,51 @@ jobs:
 
           # Use platform subdomain as primary domain
           echo "platform_domain=$SUBDOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Create Cloudflare DNS Record
+        id: cloudflare_dns
+        run: |
+          SUBDOMAIN="${{ inputs.project_slug }}"
+          PAGES_DOMAIN="${{ steps.deploy.outputs.pages_domain }}"
+
+          echo "Creating/updating CNAME record: $SUBDOMAIN.${{ env.PLATFORM_DOMAIN }} → $PAGES_DOMAIN"
+
+          # Check if record already exists
+          EXISTING=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records?type=CNAME&name=$SUBDOMAIN.${{ env.PLATFORM_DOMAIN }}" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          RECORD_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
+
+          if [ -n "$RECORD_ID" ]; then
+            echo "Record exists (ID: $RECORD_ID), updating..."
+            # Update existing record
+            RESULT=$(curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$PAGES_DOMAIN\",\"ttl\":1,\"proxied\":true}")
+          else
+            echo "Creating new record..."
+            # Create new record (proxied=true for Cloudflare Pages)
+            RESULT=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${{ env.CLOUDFLARE_ZONE_ID }}/dns_records" \
+              -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$PAGES_DOMAIN\",\"ttl\":1,\"proxied\":true}")
+          fi
+
+          echo "$RESULT"
+
+          SUCCESS=$(echo "$RESULT" | jq -r '.success // false')
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ DNS record configured successfully"
+            echo "dns_configured=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ DNS record configuration failed"
+            echo "dns_configured=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure Custom Domain
         id: custom_domain
