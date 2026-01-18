@@ -49,6 +49,8 @@ on:
         required: true
       NEON_API_KEY:
         required: true
+      NEON_ORG_ID:
+        required: true
       LUMEA_WEBHOOK_SECRET:
         required: true
       PROJECT_SECRETS:
@@ -123,7 +125,8 @@ jobs:
                 \"project\": {
                   \"name\": \"$NEON_PROJECT_NAME\",
                   \"region_id\": \"aws-us-east-1\",
-                  \"pg_version\": 17
+                  \"pg_version\": 17,
+                  \"org_id\": \"${{ secrets.NEON_ORG_ID }}\"
                 }
               }")
 
