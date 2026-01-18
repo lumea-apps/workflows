@@ -202,15 +202,24 @@ jobs:
         id: deploy
         working-directory: server
         run: |
-          # Worker name includes both slug and project ID for uniqueness
-          WORKER_NAME="lumea-api-${{ inputs.project_slug }}-${{ inputs.lumea_project_id }}"
+          # Use first 8 chars of project ID for uniqueness (standard UUID practice)
+          # This keeps worker name under 54 char limit for CF previews
+          PROJECT_ID="${{ inputs.lumea_project_id }}"
+          PROJECT_ID_SHORT="${PROJECT_ID:0:8}"
 
-          # Truncate if too long (Cloudflare limit is 63 chars)
-          if [ ${#WORKER_NAME} -gt 63 ]; then
-            WORKER_NAME="${WORKER_NAME:0:63}"
+          # Worker name: lumea-api-{slug}-{uuid8}
+          # Max: 10 (lumea-api-) + 35 (slug) + 1 (-) + 8 (uuid) = 54 chars
+          SLUG="${{ inputs.project_slug }}"
+
+          # Truncate slug if needed to stay under 54 chars total
+          MAX_SLUG_LEN=$((54 - 10 - 1 - 8))  # 35 chars max for slug
+          if [ ${#SLUG} -gt $MAX_SLUG_LEN ]; then
+            SLUG="${SLUG:0:$MAX_SLUG_LEN}"
           fi
 
-          echo "Deploying Worker: $WORKER_NAME"
+          WORKER_NAME="lumea-api-${SLUG}-${PROJECT_ID_SHORT}"
+
+          echo "Deploying Worker: $WORKER_NAME (${#WORKER_NAME} chars)"
 
           # Deploy with wrangler
           npx wrangler deploy \
@@ -225,11 +234,12 @@ jobs:
             exit 1
           fi
 
-          # API URL is deterministic (includes project ID for security)
-          API_URL="https://api-${{ inputs.project_slug }}-${{ inputs.lumea_project_id }}.${{ env.PLATFORM_DOMAIN }}"
+          # API URL uses short project ID (matches worker name)
+          API_URL="https://api-${SLUG}-${PROJECT_ID_SHORT}.${{ env.PLATFORM_DOMAIN }}"
 
           echo "api_url=$API_URL" >> $GITHUB_OUTPUT
           echo "worker_name=$WORKER_NAME" >> $GITHUB_OUTPUT
+          echo "project_id_short=$PROJECT_ID_SHORT" >> $GITHUB_OUTPUT
 
           echo "✅ Worker deployed: $WORKER_NAME"
           echo "📍 API URL will be: $API_URL"
@@ -243,7 +253,16 @@ jobs:
       - name: Configure Worker Custom Domain
         run: |
           WORKER_NAME="${{ steps.deploy.outputs.worker_name }}"
-          SUBDOMAIN="api-${{ inputs.project_slug }}-${{ inputs.lumea_project_id }}"
+          PROJECT_ID_SHORT="${{ steps.deploy.outputs.project_id_short }}"
+
+          # Truncate slug same as in deploy step
+          SLUG="${{ inputs.project_slug }}"
+          MAX_SLUG_LEN=$((54 - 10 - 1 - 8))  # 35 chars max for slug
+          if [ ${#SLUG} -gt $MAX_SLUG_LEN ]; then
+            SLUG="${SLUG:0:$MAX_SLUG_LEN}"
+          fi
+
+          SUBDOMAIN="api-${SLUG}-${PROJECT_ID_SHORT}"
           FULL_DOMAIN="${SUBDOMAIN}.${{ env.PLATFORM_DOMAIN }}"
 
           echo "Configuring custom domain: $FULL_DOMAIN for worker: $WORKER_NAME"
