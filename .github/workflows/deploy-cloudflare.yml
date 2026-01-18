@@ -294,15 +294,30 @@ jobs:
               -d "{\"type\":\"CNAME\",\"name\":\"$SUBDOMAIN\",\"content\":\"$WORKERS_DEV_DOMAIN\",\"ttl\":1,\"proxied\":true}"
           fi
 
-          # Add custom domain to worker
+          # Add custom domain to worker using Workers Custom Domains API
           echo "Adding custom domain to worker..."
-          curl -s -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/$WORKER_NAME/domains" \
+          DOMAIN_RESULT=$(curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/domains" \
             -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "{\"hostname\":\"$FULL_DOMAIN\"}" || true
+            -d "{
+              \"environment\": \"production\",
+              \"hostname\": \"$FULL_DOMAIN\",
+              \"service\": \"$WORKER_NAME\",
+              \"zone_id\": \"${{ env.CLOUDFLARE_ZONE_ID }}\"
+            }")
 
-          echo "✅ Custom domain configured: $FULL_DOMAIN"
+          echo "$DOMAIN_RESULT"
+
+          # Check if domain was added successfully
+          DOMAIN_SUCCESS=$(echo "$DOMAIN_RESULT" | jq -r '.success // false')
+          if [ "$DOMAIN_SUCCESS" = "true" ]; then
+            echo "✅ Custom domain configured: $FULL_DOMAIN"
+          else
+            ERROR_MSG=$(echo "$DOMAIN_RESULT" | jq -r '.errors[0].message // "Unknown error"')
+            echo "⚠️ Custom domain configuration: $ERROR_MSG"
+            # Don't fail - DNS CNAME is already set up as fallback
+          fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
