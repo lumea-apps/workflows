@@ -1,0 +1,282 @@
+# Reusable Workflow: Deploy to Cloudflare Pages
+#
+# This workflow should be placed in the lumea-apps/workflows repository
+# at .github/workflows/deploy-cloudflare.yml
+#
+# It handles:
+# 1. Building the Vite/React project
+# 2. Deploying to Cloudflare Pages via Wrangler
+# 3. Configuring custom domains (if provided)
+# 4. Calling the Lumea webhook with results
+#
+# Secrets required:
+# - CLOUDFLARE_API_TOKEN: Cloudflare API token with Pages permissions
+# - CLOUDFLARE_ACCOUNT_ID: Cloudflare account ID
+# - LUMEA_WEBHOOK_SECRET: Shared secret for webhook authentication
+# - PROJECT_SECRETS: JSON with project environment variables (optional)
+#
+# Used for: react-ts-fullstack template (Vite + React on CF Pages)
+
+name: Deploy to Cloudflare Pages
+
+on:
+  workflow_call:
+    inputs:
+      project_slug:
+        description: 'Project slug for platform domain'
+        required: true
+        type: string
+      lumea_project_id:
+        description: 'Lumea Project ID'
+        required: true
+        type: string
+      custom_domain:
+        description: 'Custom domain to configure (optional)'
+        required: false
+        type: string
+        default: ''
+      app_target:
+        description: 'App target for secrets filtering (web, api, all)'
+        required: false
+        type: string
+        default: 'all'
+      badge:
+        description: 'Show "Built with Lumea" badge on deployed site (true/false)'
+        required: false
+        type: string
+        default: 'true'
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      LUMEA_WEBHOOK_SECRET:
+        required: true
+      PROJECT_SECRETS:
+        required: false
+
+env:
+  PLATFORM_DOMAIN: builtwithlumea.dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js (for Wrangler)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Install Wrangler CLI
+        run: npm install -g wrangler
+
+      - name: Create .env file from secrets
+        run: |
+          SECRETS='${{ secrets.PROJECT_SECRETS }}'
+          TARGET="${{ inputs.app_target }}"
+
+          if [ -z "$SECRETS" ] || [ "$SECRETS" = "" ]; then
+            echo "No project secrets configured, skipping .env creation"
+            exit 0
+          fi
+
+          echo "Creating .env file for target: $TARGET"
+
+          # Combine "all" target with specific target
+          echo "$SECRETS" | jq -r "
+            ((.all // {}) + (.[\"$TARGET\"] // {}))
+            | to_entries[]
+            | \"\(.key)=\(.value)\"
+          " > .env
+
+          echo "Environment variables written to .env"
+
+      - name: Inject Lumea Badge
+        if: inputs.badge == 'true'
+        continue-on-error: true
+        run: |
+          echo "Injecting Lumea badge into React app..."
+
+          # Find the main index.html file
+          INDEX_FILE=""
+          if [ -f "apps/web/index.html" ]; then
+            INDEX_FILE="apps/web/index.html"
+          elif [ -f "index.html" ]; then
+            INDEX_FILE="index.html"
+          fi
+
+          if [ -z "$INDEX_FILE" ]; then
+            echo "No index.html found, skipping badge injection"
+            exit 0
+          fi
+
+          echo "Found index file: $INDEX_FILE"
+
+          # Add badge script before </body>
+          if ! grep -q "lumea.dev/badge.js" "$INDEX_FILE"; then
+            sed -i 's|</body>|<script src="https://lumea.dev/badge.js" data-project-id="${{ inputs.lumea_project_id }}" defer></script></body>|' "$INDEX_FILE"
+            echo "Badge script injected"
+          else
+            echo "Badge script already present"
+          fi
+
+      - name: Build React App
+        id: build
+        run: |
+          # Check if this is a monorepo with apps/web structure
+          if [ -d "apps/web" ]; then
+            echo "Detected monorepo structure, building apps/web..."
+            cd apps/web
+            bun run build
+            echo "build_dir=apps/web/dist" >> $GITHUB_OUTPUT
+          else
+            echo "Building root project..."
+            bun run build
+            echo "build_dir=dist" >> $GITHUB_OUTPUT
+          fi
+        env:
+          NODE_ENV: production
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        run: |
+          PROJECT_NAME="lumea-${{ inputs.project_slug }}"
+          BUILD_DIR="${{ steps.build.outputs.build_dir }}"
+
+          echo "Deploying $BUILD_DIR to Cloudflare Pages project: $PROJECT_NAME"
+
+          # Create project if it doesn't exist (ignore error if exists)
+          wrangler pages project create "$PROJECT_NAME" --production-branch=main 2>/dev/null || true
+
+          # Deploy to Cloudflare Pages
+          DEPLOY_OUTPUT=$(wrangler pages deploy "$BUILD_DIR" \
+            --project-name="$PROJECT_NAME" \
+            --branch=main \
+            --commit-dirty=true 2>&1)
+
+          echo "$DEPLOY_OUTPUT"
+
+          # Extract deployment URL from output
+          DEPLOYMENT_URL=$(echo "$DEPLOY_OUTPUT" | grep -oP 'https://[a-z0-9-]+\.pages\.dev' | head -1)
+
+          if [ -z "$DEPLOYMENT_URL" ]; then
+            # Try alternative pattern for custom domains
+            DEPLOYMENT_URL=$(echo "$DEPLOY_OUTPUT" | grep -oP 'https://[^\s]+' | head -1)
+          fi
+
+          echo "deployment_url=$DEPLOYMENT_URL" >> $GITHUB_OUTPUT
+          echo "project_name=$PROJECT_NAME" >> $GITHUB_OUTPUT
+
+          # Get the pages.dev domain
+          PAGES_DOMAIN="${PROJECT_NAME}.pages.dev"
+          echo "pages_domain=$PAGES_DOMAIN" >> $GITHUB_OUTPUT
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Configure Platform Domain
+        id: platform_domain
+        run: |
+          # For now, use the pages.dev domain as platform domain
+          # TODO: Configure custom subdomain on builtwithlumea.dev via Cloudflare
+          PLATFORM_DOMAIN="${{ steps.deploy.outputs.pages_domain }}"
+          echo "Platform domain: $PLATFORM_DOMAIN"
+          echo "platform_domain=$PLATFORM_DOMAIN" >> $GITHUB_OUTPUT
+
+      - name: Configure Custom Domain
+        id: custom_domain
+        if: inputs.custom_domain != ''
+        run: |
+          CUSTOM_DOMAIN="${{ inputs.custom_domain }}"
+          PROJECT_NAME="${{ steps.deploy.outputs.project_name }}"
+
+          echo "Configuring custom domain: $CUSTOM_DOMAIN for project: $PROJECT_NAME"
+
+          # Add custom domain to Cloudflare Pages project
+          RESULT=$(curl -s -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/pages/projects/$PROJECT_NAME/domains" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"$CUSTOM_DOMAIN\"}" 2>&1) || true
+
+          echo "$RESULT"
+
+          # Check if domain was added successfully or already exists
+          SUCCESS=$(echo "$RESULT" | jq -r '.success // false')
+
+          if [ "$SUCCESS" = "true" ]; then
+            echo "Custom domain added successfully"
+            echo "custom_domain_verified=false" >> $GITHUB_OUTPUT
+          else
+            ERROR_CODE=$(echo "$RESULT" | jq -r '.errors[0].code // empty')
+            if [ "$ERROR_CODE" = "1000" ]; then
+              echo "Custom domain already configured"
+              echo "custom_domain_verified=true" >> $GITHUB_OUTPUT
+            else
+              echo "Failed to add custom domain"
+              echo "custom_domain_verified=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Notify Lumea (Success)
+        if: success()
+        run: |
+          # Build webhook payload
+          PAYLOAD=$(cat <<EOF
+          {
+            "projectId": "${{ inputs.lumea_project_id }}",
+            "status": "ready",
+            "deploymentUrl": "${{ steps.deploy.outputs.deployment_url }}",
+            "platformDomain": "${{ steps.platform_domain.outputs.platform_domain }}",
+            "workflowRunId": "${{ github.run_id }}",
+            "commitSha": "${{ github.sha }}",
+            "logsUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "deploymentConfig": {
+              "provider": "cloudflare",
+              "projectName": "${{ steps.deploy.outputs.project_name }}",
+              "pagesDomain": "${{ steps.deploy.outputs.pages_domain }}"
+            }
+          EOF
+          )
+
+          # Add custom domain info if configured
+          if [ -n "${{ inputs.custom_domain }}" ]; then
+            PAYLOAD="${PAYLOAD},
+            \"customDomain\": \"${{ inputs.custom_domain }}\",
+            \"customDomainVerified\": ${{ steps.custom_domain.outputs.custom_domain_verified || 'false' }}"
+          fi
+
+          PAYLOAD="${PAYLOAD}}"
+
+          echo "Sending webhook to Lumea..."
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -d "$PAYLOAD"
+
+      - name: Notify Lumea (Failure)
+        if: failure()
+        run: |
+          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
+            -d '{
+              "projectId": "${{ inputs.lumea_project_id }}",
+              "status": "error",
+              "error": "Build or deployment failed",
+              "workflowRunId": "${{ github.run_id }}",
+              "logsUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
