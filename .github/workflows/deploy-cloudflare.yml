@@ -180,33 +180,44 @@ jobs:
           echo "📍 Database URL retrieved successfully"
 
       # --------------------------------------------------------------------
-      # Run Database Migrations
+      # Run Database Migrations / Push Schema
       # --------------------------------------------------------------------
       - name: Run Database Migrations
         working-directory: server
         run: |
-          echo "Running database migrations..."
+          echo "Running database schema setup..."
 
-          # Check if migration script exists
-          if [ -f "package.json" ]; then
-            # Check for common migration commands
-            if grep -q '"db:migrate"' package.json; then
-              echo "Running: bun run db:migrate"
-              bun run db:migrate
-            elif grep -q '"migrate"' package.json; then
-              echo "Running: bun run migrate"
-              bun run migrate
-            elif grep -q '"drizzle-kit"' package.json; then
-              echo "Running: bunx drizzle-kit migrate"
-              bunx drizzle-kit migrate
-            else
-              echo "No migration script found, skipping migrations"
-            fi
-          else
-            echo "No package.json found in server/, skipping migrations"
+          # Check if migration files exist
+          MIGRATIONS_EXIST=false
+          if [ -d "drizzle" ] && [ -f "drizzle/meta/_journal.json" ]; then
+            MIGRATIONS_EXIST=true
           fi
 
-          echo "✅ Migrations completed"
+          if [ -f "package.json" ]; then
+            if [ "$MIGRATIONS_EXIST" = "true" ]; then
+              # Migrations exist - run migrate
+              echo "Migrations found, running migrate..."
+              if grep -q '"db:migrate"' package.json; then
+                bun run db:migrate
+              elif grep -q '"migrate"' package.json; then
+                bun run migrate
+              else
+                bunx drizzle-kit migrate
+              fi
+            else
+              # No migrations - use push to apply schema directly
+              echo "No migrations found, using db:push to apply schema..."
+              if grep -q '"db:push"' package.json; then
+                bun run db:push
+              else
+                bunx drizzle-kit push
+              fi
+            fi
+          else
+            echo "No package.json found in server/, skipping"
+          fi
+
+          echo "✅ Database schema applied"
         env:
           DATABASE_URL: ${{ steps.neon.outputs.database_url }}
 
