@@ -178,27 +178,6 @@ jobs:
           echo "📍 Database URL retrieved successfully"
 
       # --------------------------------------------------------------------
-      # Create .dev.vars for Worker secrets
-      # --------------------------------------------------------------------
-      - name: Create Worker secrets file
-        working-directory: server
-        run: |
-          SECRETS='${{ secrets.PROJECT_SECRETS }}'
-
-          # Start with DATABASE_URL
-          echo "DATABASE_URL=${{ steps.neon.outputs.database_url }}" > .dev.vars
-
-          if [ -n "$SECRETS" ] && [ "$SECRETS" != "" ]; then
-            echo "Adding project secrets to .dev.vars..."
-            # Filter for 'api' and 'all' targets
-            echo "$SECRETS" | jq -r '
-              ((.all // {}) + ((.api // {})))
-              | to_entries[]
-              | "\(.key)=\(.value)"
-            ' >> .dev.vars 2>/dev/null || true
-          fi
-
-      # --------------------------------------------------------------------
       # Deploy Worker
       # --------------------------------------------------------------------
       - name: Deploy Worker
@@ -222,12 +201,22 @@ jobs:
 
           WORKER_NAME="lumea-api-${SLUG}-${PROJECT_ID_SHORT}"
 
-          echo "Deploying Worker: $WORKER_NAME (${#WORKER_NAME} chars)"
+          # Production URLs
+          FRONTEND_URL="https://${SLUG}.${{ env.PLATFORM_DOMAIN }}"
+          API_URL="https://api-${SLUG}-${PROJECT_ID_SHORT}.${{ env.PLATFORM_DOMAIN }}"
 
-          # Deploy with wrangler
+          echo "Deploying Worker: $WORKER_NAME (${#WORKER_NAME} chars)"
+          echo "Frontend URL: $FRONTEND_URL"
+          echo "API URL: $API_URL"
+
+          # Deploy with wrangler and production environment variables
           npx wrangler deploy \
             --name "$WORKER_NAME" \
             --compatibility-date "2024-01-01" \
+            --var NODE_ENV:production \
+            --var LOG_LEVEL:info \
+            --var CORS_ORIGINS:"$FRONTEND_URL" \
+            --var BETTER_AUTH_URL:"$FRONTEND_URL" \
             2>&1 | tee deploy_output.txt
 
           # Check if deploy succeeded
@@ -237,15 +226,45 @@ jobs:
             exit 1
           fi
 
-          # API URL uses short project ID (matches worker name)
-          API_URL="https://api-${SLUG}-${PROJECT_ID_SHORT}.${{ env.PLATFORM_DOMAIN }}"
-
           echo "api_url=$API_URL" >> $GITHUB_OUTPUT
           echo "worker_name=$WORKER_NAME" >> $GITHUB_OUTPUT
           echo "project_id_short=$PROJECT_ID_SHORT" >> $GITHUB_OUTPUT
 
           echo "✅ Worker deployed: $WORKER_NAME"
-          echo "📍 API URL will be: $API_URL"
+          echo "📍 API URL: $API_URL"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --------------------------------------------------------------------
+      # Set Worker Secrets (DATABASE_URL + project secrets)
+      # --------------------------------------------------------------------
+      - name: Set Worker Secrets
+        working-directory: server
+        run: |
+          WORKER_NAME="${{ steps.deploy.outputs.worker_name }}"
+
+          echo "Setting DATABASE_URL secret..."
+          echo "${{ steps.neon.outputs.database_url }}" | npx wrangler secret put DATABASE_URL --name "$WORKER_NAME"
+
+          # Add any additional project secrets for API
+          SECRETS='${{ secrets.PROJECT_SECRETS }}'
+          if [ -n "$SECRETS" ] && [ "$SECRETS" != "" ]; then
+            echo "Setting project secrets..."
+            # Get api and all secrets
+            echo "$SECRETS" | jq -r '
+              ((.all // {}) + ((.api // {})))
+              | to_entries[]
+              | "\(.key)=\(.value)"
+            ' | while IFS='=' read -r key value; do
+              if [ -n "$key" ] && [ -n "$value" ]; then
+                echo "Setting secret: $key"
+                echo "$value" | npx wrangler secret put "$key" --name "$WORKER_NAME"
+              fi
+            done 2>/dev/null || true
+          fi
+
+          echo "✅ Worker secrets configured"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
