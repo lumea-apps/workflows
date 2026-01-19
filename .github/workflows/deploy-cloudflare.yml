@@ -111,9 +111,8 @@ jobs:
 
           echo "Found $(echo "$PROJECTS" | jq '.projects | length') projects in org"
 
-          # Check if our project exists (by name)
-          EXISTING_PROJECT=$(echo "$PROJECTS" | jq -r ".projects[]? | select(.name == \"$NEON_PROJECT_NAME\")")
-          NEON_PROJECT_ID=$(echo "$EXISTING_PROJECT" | jq -r '.id // empty')
+          # Check if our project exists (by name) - take first match if duplicates exist
+          NEON_PROJECT_ID=$(echo "$PROJECTS" | jq -r "[.projects[]? | select(.name == \"$NEON_PROJECT_NAME\")] | first | .id // empty")
 
           if [ -z "$NEON_PROJECT_ID" ]; then
             echo "Neon project does not exist, creating..."
