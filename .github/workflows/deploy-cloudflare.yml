@@ -153,16 +153,19 @@ jobs:
             DATABASE_URL=$(echo "$CREATE_RESULT" | jq -r '.connection_uris[0].connection_uri // empty')
 
             echo "✅ Neon project created: $NEON_PROJECT_NAME (ID: $NEON_PROJECT_ID)"
+            echo "is_new_project=true" >> $GITHUB_OUTPUT
           else
             echo "✅ Neon project already exists: $NEON_PROJECT_NAME (ID: $NEON_PROJECT_ID)"
+            echo "is_new_project=false" >> $GITHUB_OUTPUT
 
-            # Get connection URI from existing project
-            PROJECT_INFO=$(curl -s -X GET \
-              "https://console.neon.tech/api/v2/projects/$NEON_PROJECT_ID" \
+            # Get connection URI using dedicated endpoint (more reliable)
+            # Default database is 'neondb', default role is 'neondb_owner'
+            CONNECTION_RESULT=$(curl -s -X GET \
+              "https://console.neon.tech/api/v2/projects/$NEON_PROJECT_ID/connection_uri?database_name=neondb&role_name=neondb_owner" \
               -H "Authorization: Bearer ${{ secrets.NEON_API_KEY }}" \
               -H "Accept: application/json")
 
-            DATABASE_URL=$(echo "$PROJECT_INFO" | jq -r '.project.connection_uris[0].connection_uri // empty')
+            DATABASE_URL=$(echo "$CONNECTION_RESULT" | jq -r '.uri // empty')
           fi
 
           if [ -z "$DATABASE_URL" ]; then
@@ -176,6 +179,65 @@ jobs:
           echo "::add-mask::$DATABASE_URL"
 
           echo "📍 Database URL retrieved successfully"
+
+      # --------------------------------------------------------------------
+      # Run Database Migrations
+      # --------------------------------------------------------------------
+      - name: Run Database Migrations
+        working-directory: server
+        run: |
+          echo "Running database migrations..."
+
+          # Check if migration script exists
+          if [ -f "package.json" ]; then
+            # Check for common migration commands
+            if grep -q '"db:migrate"' package.json; then
+              echo "Running: bun run db:migrate"
+              bun run db:migrate
+            elif grep -q '"migrate"' package.json; then
+              echo "Running: bun run migrate"
+              bun run migrate
+            elif grep -q '"drizzle-kit"' package.json; then
+              echo "Running: bunx drizzle-kit migrate"
+              bunx drizzle-kit migrate
+            else
+              echo "No migration script found, skipping migrations"
+            fi
+          else
+            echo "No package.json found in server/, skipping migrations"
+          fi
+
+          echo "✅ Migrations completed"
+        env:
+          DATABASE_URL: ${{ steps.neon.outputs.database_url }}
+
+      # --------------------------------------------------------------------
+      # Run Database Seed (only for new projects)
+      # --------------------------------------------------------------------
+      - name: Run Database Seed
+        if: steps.neon.outputs.is_new_project == 'true'
+        working-directory: server
+        run: |
+          echo "Running database seed (new project)..."
+
+          # Check if seed script exists
+          if [ -f "package.json" ]; then
+            if grep -q '"db:seed"' package.json; then
+              echo "Running: bun run db:seed"
+              bun run db:seed
+            elif grep -q '"seed"' package.json; then
+              echo "Running: bun run seed"
+              bun run seed
+            else
+              echo "No seed script found, skipping"
+            fi
+          else
+            echo "No package.json found in server/, skipping seed"
+          fi
+
+          echo "✅ Seed completed"
+        env:
+          DATABASE_URL: ${{ steps.neon.outputs.database_url }}
 
       # --------------------------------------------------------------------
       # Deploy Worker
