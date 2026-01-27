@@ -292,72 +292,99 @@ jobs:
           echo "challenge_value=$CHALLENGE_VALUE" >> $GITHUB_OUTPUT
           echo "challenge_reason=$CHALLENGE_REASON" >> $GITHUB_OUTPUT
 
-      - name: Notify Lumea (Success)
-        if: success()
+    outputs:
+      deployment_url: ${{ steps.deploy.outputs.deployment_url }}
+      platform_domain: ${{ steps.platform_domain.outputs.platform_domain }}
+      project_id: ${{ steps.deploy.outputs.project_id }}
+      custom_domain_verified: ${{ steps.custom_domain.outputs.verified }}
+      challenge_type: ${{ steps.custom_domain.outputs.challenge_type }}
+      challenge_domain: ${{ steps.custom_domain.outputs.challenge_domain }}
+      challenge_value: ${{ steps.custom_domain.outputs.challenge_value }}
+      challenge_reason: ${{ steps.custom_domain.outputs.challenge_reason }}
+
+  # Separate notify job that ALWAYS runs, even if deploy fails or is cancelled
+  # This ensures we never leave deployments stuck in "building" state
+  notify:
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    steps:
+      - name: Notify Lumea
         run: |
-          # Build webhook payload
-          PAYLOAD=$(cat <<EOF
+          DEPLOY_RESULT="${{ needs.deploy.result }}"
+          echo "Deploy job result: $DEPLOY_RESULT"
+
+          if [ "$DEPLOY_RESULT" = "success" ]; then
+            # Build success payload
+            PAYLOAD=$(cat <<EOF
           {
             "projectId": "${{ inputs.lumea_project_id }}",
             "status": "ready",
-            "deploymentUrl": "${{ steps.deploy.outputs.deployment_url }}",
-            "platformDomain": "${{ steps.platform_domain.outputs.platform_domain }}",
+            "deploymentUrl": "${{ needs.deploy.outputs.deployment_url }}",
+            "platformDomain": "${{ needs.deploy.outputs.platform_domain }}",
             "workflowRunId": "${{ github.run_id }}",
             "commitSha": "${{ github.sha }}",
             "logsUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
             "deploymentConfig": {
               "provider": "vercel",
-              "projectId": "${{ steps.deploy.outputs.project_id }}",
+              "projectId": "${{ needs.deploy.outputs.project_id }}",
               "projectName": "lumea-${{ inputs.project_slug }}"
             }
           EOF
-          )
-
-          # Add custom domain info if configured
-          if [ -n "${{ inputs.custom_domain }}" ]; then
-            CUSTOM_DOMAIN_PAYLOAD=$(cat <<EOF
-            ,
-            "customDomain": "${{ inputs.custom_domain }}",
-            "customDomainVerified": ${{ steps.custom_domain.outputs.verified || 'false' }}
-          EOF
             )
 
-            # Add challenge if present
-            if [ -n "${{ steps.custom_domain.outputs.challenge_type }}" ]; then
-              CHALLENGE_PAYLOAD=$(cat <<EOF
-              ,
-              "customDomainChallenge": {
-                "type": "${{ steps.custom_domain.outputs.challenge_type }}",
-                "domain": "${{ steps.custom_domain.outputs.challenge_domain }}",
-                "value": "${{ steps.custom_domain.outputs.challenge_value }}",
-                "reason": "${{ steps.custom_domain.outputs.challenge_reason }}"
-              }
+            # Add custom domain info if configured
+            if [ -n "${{ inputs.custom_domain }}" ]; then
+              CUSTOM_DOMAIN_PAYLOAD=$(cat <<EOF
+            ,
+            "customDomain": "${{ inputs.custom_domain }}",
+            "customDomainVerified": ${{ needs.deploy.outputs.custom_domain_verified || 'false' }}
           EOF
               )
-              CUSTOM_DOMAIN_PAYLOAD="${CUSTOM_DOMAIN_PAYLOAD}${CHALLENGE_PAYLOAD}"
+
+              # Add challenge if present
+              if [ -n "${{ needs.deploy.outputs.challenge_type }}" ]; then
+                CHALLENGE_PAYLOAD=$(cat <<EOF
+              ,
+              "customDomainChallenge": {
+                "type": "${{ needs.deploy.outputs.challenge_type }}",
+                "domain": "${{ needs.deploy.outputs.challenge_domain }}",
+                "value": "${{ needs.deploy.outputs.challenge_value }}",
+                "reason": "${{ needs.deploy.outputs.challenge_reason }}"
+              }
+          EOF
+                )
+                CUSTOM_DOMAIN_PAYLOAD="${CUSTOM_DOMAIN_PAYLOAD}${CHALLENGE_PAYLOAD}"
+              fi
+
+              PAYLOAD="${PAYLOAD}${CUSTOM_DOMAIN_PAYLOAD}"
             fi
 
-            PAYLOAD="${PAYLOAD}${CUSTOM_DOMAIN_PAYLOAD}"
+            PAYLOAD="${PAYLOAD}}"
+          else
+            # Build failure/cancelled payload
+            ERROR_MSG="Build or deployment failed"
+            if [ "$DEPLOY_RESULT" = "cancelled" ]; then
+              ERROR_MSG="Deployment was cancelled"
+            elif [ "$DEPLOY_RESULT" = "skipped" ]; then
+              ERROR_MSG="Deployment was skipped"
+            fi
+
+            PAYLOAD=$(cat <<EOF
+          {
+            "projectId": "${{ inputs.lumea_project_id }}",
+            "status": "error",
+            "error": "$ERROR_MSG",
+            "workflowRunId": "${{ github.run_id }}",
+            "logsUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+            )
           fi
 
-          PAYLOAD="${PAYLOAD}}"
-
           echo "Sending webhook to Lumea..."
+          echo "Payload: $PAYLOAD"
           curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
             -d "$PAYLOAD"
-
-      - name: Notify Lumea (Failure)
-        if: failure()
-        run: |
-          curl -X POST "${{ vars.LUMEA_WEBHOOK_URL }}" \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${{ secrets.LUMEA_WEBHOOK_SECRET }}" \
-            -d '{
-              "projectId": "${{ inputs.lumea_project_id }}",
-              "status": "error",
-              "error": "Build or deployment failed",
-              "workflowRunId": "${{ github.run_id }}",
-              "logsUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }'
